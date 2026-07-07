@@ -96,8 +96,9 @@ impl JobProcessor for WhisperJobProcessor {
                 }
 
                 Ok(JobProcessResult::Completed {
-                    segments: filter_hallucinated_segments_with_history(
+                    segments: prepare_segments_for_insert(
                         &previous_segments,
+                        job,
                         segments_from_state(job, &state)?,
                     ),
                 })
@@ -184,6 +185,69 @@ pub fn filter_hallucinated_segments_with_history(
     filtered
 }
 
+pub fn prepare_segments_for_insert(
+    previous_segments: &[Segment],
+    job: &TranscribeJob,
+    segments: Vec<NewSegment>,
+) -> Vec<NewSegment> {
+    suppress_similar_overlaps(
+        previous_segments,
+        filter_hallucinated_segments_with_history(
+            previous_segments,
+            clip_segments_to_valid_range(job, segments),
+        ),
+    )
+}
+
+pub fn clip_segments_to_valid_range(
+    job: &TranscribeJob,
+    segments: Vec<NewSegment>,
+) -> Vec<NewSegment> {
+    let valid_start_ms = job.valid_start_ms as i64;
+    let valid_end_ms = job.valid_end_ms as i64;
+    segments
+        .into_iter()
+        .filter_map(|mut segment| {
+            let center_ms = segment_center_ms(&segment);
+            if center_ms < valid_start_ms || center_ms >= valid_end_ms {
+                return None;
+            }
+
+            segment.start_ms = segment.start_ms.max(valid_start_ms);
+            segment.end_ms = segment.end_ms.min(valid_end_ms);
+            (segment.start_ms < segment.end_ms).then_some(segment)
+        })
+        .collect()
+}
+
+pub fn suppress_similar_overlaps(
+    previous_segments: &[Segment],
+    segments: Vec<NewSegment>,
+) -> Vec<NewSegment> {
+    let mut accepted = Vec::with_capacity(segments.len());
+    let mut last_segment = previous_segments.last().cloned();
+
+    for segment in segments {
+        if last_segment.as_ref().is_some_and(|last| {
+            overlaps_previous(last, &segment) && has_similar_text(last, &segment)
+        }) {
+            continue;
+        }
+
+        last_segment = Some(Segment {
+            id: 0,
+            session_id: segment.session_id.clone(),
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            text: segment.text.clone(),
+            lang: segment.lang.clone(),
+        });
+        accepted.push(segment);
+    }
+
+    accepted
+}
+
 fn segments_for_session(db: &Db, session_id: &str) -> Result<Vec<Segment>, AppError> {
     db.list_segments(session_id)
         .map_err(|error| AppError::new(DB_ERROR, format!("database error: {error}")))
@@ -268,6 +332,24 @@ fn consecutive_tail_repeat(segments: &[Segment]) -> (String, usize) {
     };
     let repeat_count = 1 + iter.take_while(|text| text == &previous_text).count();
     (previous_text, repeat_count)
+}
+
+fn segment_center_ms(segment: &NewSegment) -> i64 {
+    segment.start_ms + (segment.end_ms - segment.start_ms) / 2
+}
+
+fn overlaps_previous(previous: &Segment, segment: &NewSegment) -> bool {
+    segment.start_ms < previous.end_ms
+}
+
+fn has_similar_text(previous: &Segment, segment: &NewSegment) -> bool {
+    let previous_text = normalize_for_filter(&previous.text);
+    let segment_text = normalize_for_filter(&segment.text);
+    !previous_text.is_empty()
+        && !segment_text.is_empty()
+        && (previous_text == segment_text
+            || previous_text.contains(&segment_text)
+            || segment_text.contains(&previous_text))
 }
 
 fn whisper_error(message: impl Into<String>) -> AppError {
@@ -360,6 +442,79 @@ mod tests {
         let _rt_params = build_full_params(&rt_job, Some("直前テキスト"), None);
         let _batch_params =
             build_full_params(&batch_job, None, Some(Arc::new(AtomicBool::new(false))));
+    }
+
+    #[test]
+    fn clipping_keeps_only_segments_owned_by_valid_range() {
+        let job = TranscribeJob {
+            valid_start_ms: 1_500,
+            valid_end_ms: 3_000,
+            ..job(JobKind::Batch, Language::Ja)
+        };
+        let mut before = new_segment("before");
+        before.start_ms = 1_000;
+        before.end_ms = 1_400;
+        let mut crossing_start = new_segment("crossing-start");
+        crossing_start.start_ms = 1_300;
+        crossing_start.end_ms = 1_700;
+        let mut crossing_end = new_segment("crossing-end");
+        crossing_end.start_ms = 2_600;
+        crossing_end.end_ms = 3_200;
+        let mut at_end = new_segment("at-end");
+        at_end.start_ms = 2_900;
+        at_end.end_ms = 3_100;
+
+        let clipped =
+            clip_segments_to_valid_range(&job, vec![before, crossing_start, crossing_end, at_end]);
+
+        assert_eq!(
+            clipped,
+            vec![
+                NewSegment {
+                    start_ms: 1_500,
+                    end_ms: 1_700,
+                    ..new_segment("crossing-start")
+                },
+                NewSegment {
+                    start_ms: 2_600,
+                    end_ms: 3_000,
+                    ..new_segment("crossing-end")
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn similar_overlap_suppression_drops_equal_and_contained_text() {
+        let previous = vec![Segment {
+            text: "hello world".to_string(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            ..segment_row("ignored")
+        }];
+        let mut equal_overlap = new_segment("helloworld");
+        equal_overlap.start_ms = 1_900;
+        equal_overlap.end_ms = 2_400;
+        let mut contained_overlap = new_segment("hello world again");
+        contained_overlap.start_ms = 1_950;
+        contained_overlap.end_ms = 2_500;
+        let mut no_overlap = new_segment("hello world");
+        no_overlap.start_ms = 2_000;
+        no_overlap.end_ms = 2_600;
+
+        let filtered = suppress_similar_overlaps(
+            &previous,
+            vec![equal_overlap, contained_overlap, no_overlap],
+        );
+
+        assert_eq!(
+            filtered,
+            vec![NewSegment {
+                start_ms: 2_000,
+                end_ms: 2_600,
+                ..new_segment("hello world")
+            }]
+        );
     }
 
     fn segment_row(text: &str) -> Segment {
