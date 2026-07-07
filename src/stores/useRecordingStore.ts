@@ -3,12 +3,19 @@ import {
   getRecordingState,
   getSettings,
   listAudioDevices,
+  pauseRecording,
+  resumeRecording,
   startRecording,
+  stopRecording,
 } from "../lib/api";
 import type {
   AudioDevices,
   Language,
+  RecordingDropsEvent,
+  RecordingElapsedEvent,
+  RecordingLevelEvent,
   RecordingState,
+  Session,
   Source,
   StartRecordingRequest,
 } from "../lib/types";
@@ -26,9 +33,12 @@ interface RecordingSetup {
 interface RecordingStore {
   devices: AudioDevices | null;
   state: RecordingState;
+  levels: RecordingLevelEvent;
+  dropCount: number;
   setup: RecordingSetup;
   loading: boolean;
   starting: boolean;
+  stopping: boolean;
   error: string | null;
   load: () => Promise<void>;
   setSource: (source: RecordingSource) => void;
@@ -37,6 +47,12 @@ interface RecordingStore {
   setMicDevice: (micDevice: string | null) => void;
   setLoopbackDevice: (loopbackDevice: string | null) => void;
   start: () => Promise<void>;
+  pause: () => Promise<void>;
+  resume: () => Promise<void>;
+  stop: () => Promise<Session | null>;
+  applyLevel: (event: RecordingLevelEvent) => void;
+  applyElapsed: (event: RecordingElapsedEvent) => void;
+  applyDrops: (event: RecordingDropsEvent) => void;
 }
 
 const initialState: RecordingState = {
@@ -57,9 +73,12 @@ const initialSetup: RecordingSetup = {
 export const useRecordingStore = create<RecordingStore>((set, get) => ({
   devices: null,
   state: initialState,
+  levels: { mic: 0, system: 0 },
+  dropCount: 0,
   setup: initialSetup,
   loading: false,
   starting: false,
+  stopping: false,
   error: null,
 
   async load() {
@@ -130,11 +149,68 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
           active: true,
           sessionId: state.sessionId ?? sessionId,
         },
+        levels: { mic: 0, system: 0 },
+        dropCount: 0,
         starting: false,
       });
     } catch (error) {
       set({ error: errorMessage(error), starting: false });
     }
+  },
+
+  async pause() {
+    set({ error: null });
+    try {
+      await pauseRecording();
+      const state = await getRecordingState();
+      set({ state });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  async resume() {
+    set({ error: null });
+    try {
+      await resumeRecording();
+      const state = await getRecordingState();
+      set({ state });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  async stop() {
+    set({ stopping: true, error: null });
+    try {
+      const session = await stopRecording();
+      set({
+        state: initialState,
+        levels: { mic: 0, system: 0 },
+        stopping: false,
+      });
+      return session;
+    } catch (error) {
+      set({ error: errorMessage(error), stopping: false });
+      return null;
+    }
+  },
+
+  applyLevel(event) {
+    set({ levels: event });
+  },
+
+  applyElapsed(event) {
+    set((current) => ({
+      state: {
+        ...current.state,
+        elapsedMs: event.elapsedMs,
+      },
+    }));
+  },
+
+  applyDrops(event) {
+    set({ dropCount: event.dropCount });
   },
 }));
 

@@ -4,6 +4,7 @@ import type {
   RecordingElapsedEvent,
   RecordingLevelEvent,
 } from "./types";
+import { useRecordingStore } from "../stores/useRecordingStore";
 
 let initialized = false;
 const unlisteners: UnlistenFn[] = [];
@@ -18,14 +19,14 @@ export async function initEventListeners() {
     await listen("session://status", () => {
       // Store wiring is added with the session store.
     }),
-    await listen<RecordingLevelEvent>("recording://level", () => {
-      // Store wiring is added with the recording store.
+    await listen<RecordingLevelEvent>("recording://level", (event) => {
+      useRecordingStore.getState().applyLevel(event.payload);
     }),
-    await listen<RecordingElapsedEvent>("recording://elapsed", () => {
-      // Store wiring is added with the recording store.
+    await listen<RecordingElapsedEvent>("recording://elapsed", (event) => {
+      useRecordingStore.getState().applyElapsed(event.payload);
     }),
-    await listen<RecordingDropsEvent>("recording://drops", () => {
-      // Toast wiring is added with the recording in-progress UI.
+    await listen<RecordingDropsEvent>("recording://drops", (event) => {
+      useRecordingStore.getState().applyDrops(event.payload);
     }),
   );
 }

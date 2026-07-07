@@ -1,4 +1,6 @@
 import { useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { formatDuration } from "../lib/format";
 import { useRecordingStore } from "../stores/useRecordingStore";
 import type { AudioDevice, Language, Source } from "../lib/types";
 
@@ -19,12 +21,16 @@ const languageOptions: Array<{ value: Language; label: string }> = [
 const modelOptions = ["medium-q5_0", "small-q5_0", "base-q5_0"];
 
 export default function Record() {
+  const navigate = useNavigate();
   const {
     devices,
     state,
+    levels,
+    dropCount,
     setup,
     loading,
     starting,
+    stopping,
     error,
     load,
     setSource,
@@ -33,6 +39,9 @@ export default function Record() {
     setMicDevice,
     setLoopbackDevice,
     start,
+    pause,
+    resume,
+    stop,
   } = useRecordingStore();
 
   useEffect(() => {
@@ -72,15 +81,24 @@ export default function Record() {
       ) : null}
 
       {state.active ? (
-        <section className="border-t border-line pt-5">
-          <div className="flex items-center gap-3">
-            <span className="h-3 w-3 rounded-full bg-accent animate-rec-pulse" />
-            <div>
-              <h2 className="text-title">録音中</h2>
-              <p className="mt-1 text-meta text-ink-2">{state.sessionId ?? "-"}</p>
-            </div>
-          </div>
-        </section>
+        <RecordingInProgress
+          elapsedMs={state.elapsedMs}
+          paused={state.paused}
+          sessionId={state.sessionId}
+          micLevel={levels.mic}
+          systemLevel={levels.system}
+          dropCount={dropCount}
+          stopping={stopping}
+          onPause={() => void pause()}
+          onResume={() => void resume()}
+          onStop={() => {
+            void stop().then((session) => {
+              if (session) {
+                navigate(`/session/${session.id}`);
+              }
+            });
+          }}
+        />
       ) : (
         <section className="grid gap-6 border-t border-line pt-5">
           <div>
@@ -94,7 +112,7 @@ export default function Record() {
                   className={[
                     "h-11 rounded-btn border px-3 text-body font-semibold",
                     setup.source === option.value
-                      ? "border-accent bg-accent text-white shadow-accent"
+                      ? "border-ink bg-ink text-white shadow-card"
                       : "border-line-strong bg-surface text-ink hover:bg-surface-2",
                   ].join(" ")}
                 >
@@ -155,6 +173,103 @@ export default function Record() {
         </section>
       )}
     </section>
+  );
+}
+
+function RecordingInProgress({
+  elapsedMs,
+  paused,
+  sessionId,
+  micLevel,
+  systemLevel,
+  dropCount,
+  stopping,
+  onPause,
+  onResume,
+  onStop,
+}: {
+  elapsedMs: number;
+  paused: boolean;
+  sessionId: string | null;
+  micLevel: number;
+  systemLevel: number;
+  dropCount: number;
+  stopping: boolean;
+  onPause: () => void;
+  onResume: () => void;
+  onStop: () => void;
+}) {
+  return (
+    <section className="grid gap-6 border-t border-line pt-5">
+      <div className="flex items-start justify-between gap-6">
+        <div>
+          <div className="flex items-center gap-3">
+            <span className="h-3 w-3 rounded-full bg-accent animate-rec-pulse" />
+            <span className="text-title">{paused ? "一時停止中" : "録音中"}</span>
+          </div>
+          <p className="mt-2 max-w-xl break-all text-meta text-ink-2">{sessionId ?? "-"}</p>
+        </div>
+        <div className="text-right">
+          <div className="text-time-lg tabular-nums text-ink">{formatDuration(elapsedMs)}</div>
+          {dropCount > 0 ? (
+            <div className="mt-2 rounded-chip bg-warn-soft px-2 py-1 text-meta text-ink">
+              欠落 {dropCount}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <LevelMeter label="マイク" value={micLevel} />
+        <LevelMeter label="システム音声" value={systemLevel} />
+      </div>
+
+      <div className="flex items-center justify-end gap-3 border-t border-line pt-5">
+        {paused ? (
+          <button
+            type="button"
+            onClick={onResume}
+            disabled={stopping}
+            className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            再開
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onPause}
+            disabled={stopping}
+            className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            一時停止
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onStop}
+          disabled={stopping}
+          className="h-10 min-w-28 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+        >
+          {stopping ? "停止中" : "停止"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function LevelMeter({ label, value }: { label: string; value: number }) {
+  const normalized = Math.max(0, Math.min(1, value));
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between text-meta">
+        <span className="text-ink">{label}</span>
+        <span className="tabular-nums text-ink-2">{Math.round(normalized * 100)}</span>
+      </div>
+      <div className="h-3 overflow-hidden rounded-chip bg-elevate">
+        <div className="h-full bg-[#2F6F6D]" style={{ width: `${normalized * 100}%` }} />
+      </div>
+    </div>
   );
 }
 
