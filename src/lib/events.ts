@@ -3,6 +3,7 @@ import type {
   RecordingDropsEvent,
   RecordingElapsedEvent,
   RecordingLevelEvent,
+  SoundCheckLevelEvent,
 } from "./types";
 import { useRecordingStore } from "../stores/useRecordingStore";
 
@@ -27,6 +28,9 @@ export async function initEventListeners() {
     }),
     await listen<RecordingDropsEvent>("recording://drops", (event) => {
       useRecordingStore.getState().applyDrops(event.payload);
+    }),
+    await listen<SoundCheckLevelEvent>("soundcheck://level", () => {
+      // Store wiring is added with the sound check UI panel.
     }),
   );
 }

@@ -88,3 +88,23 @@ export interface RecordingElapsedEvent {
 export interface RecordingDropsEvent {
   dropCount: number;
 }
+
+export interface SoundCheckRequest {
+  source: Exclude<Source, "import">;
+  micDevice?: string | null;
+  loopbackDevice?: string | null;
+  durationMs?: number | null;
+}
+
+export interface SoundCheckResult {
+  wavPath: string;
+  durationMs: number;
+  peakMicDb: number;
+  peakSystemDb: number;
+  warnings: string[];
+}
+
+export interface SoundCheckLevelEvent {
+  mic: number;
+  system: number;
+}

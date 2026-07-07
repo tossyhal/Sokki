@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod recording;
 pub mod settings;
+pub mod sound_check;
 
 use tauri::Manager;
 
@@ -20,6 +21,7 @@ pub fn run() {
             app.manage(db::Db::open(data_dir.join("sokki.db"))?);
             app.manage(recording::RecordingManager::new());
             app.manage(settings::SettingsStore::at_data_dir(&data_dir));
+            app.manage(sound_check::SoundCheckManager::new());
             log::info!("Sokki app data directory: {}", data_dir.display());
             Ok(())
         })
@@ -30,6 +32,7 @@ pub fn run() {
             commands::list_audio_devices,
             commands::pause_recording,
             commands::resume_recording,
+            commands::run_sound_check,
             commands::start_recording,
             commands::stop_recording,
             commands::update_settings

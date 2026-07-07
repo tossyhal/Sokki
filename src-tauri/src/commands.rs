@@ -9,6 +9,9 @@ use crate::recording::{
     RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
 };
 use crate::settings::{Settings, SettingsPatch, SettingsStore};
+use crate::sound_check::{
+    SoundCheckManager, SoundCheckRequest, SoundCheckResult, TauriSoundCheckEventSink,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,6 +108,25 @@ pub fn get_recording_state(
     recording_manager: tauri::State<'_, RecordingManager>,
 ) -> Result<RecordingStateSnapshot, AppError> {
     recording_manager.state()
+}
+
+#[tauri::command]
+pub fn run_sound_check(
+    app: tauri::AppHandle,
+    recording_manager: tauri::State<'_, RecordingManager>,
+    sound_check_manager: tauri::State<'_, SoundCheckManager>,
+    request: SoundCheckRequest,
+) -> Result<SoundCheckResult, AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    sound_check_manager.run(
+        &recording_manager,
+        &data_dir,
+        request,
+        &TauriSoundCheckEventSink::new(app),
+    )
 }
 
 #[cfg(test)]

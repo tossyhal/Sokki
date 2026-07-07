@@ -4,6 +4,8 @@ import type {
   RecordingState,
   Session,
   Settings,
+  SoundCheckRequest,
+  SoundCheckResult,
   StartRecordingRequest,
   SystemInfo,
 } from "./types";
@@ -42,4 +44,8 @@ export function stopRecording(): Promise<Session> {
 
 export function getRecordingState(): Promise<RecordingState> {
   return invoke<RecordingState>("get_recording_state");
+}
+
+export function runSoundCheck(request: SoundCheckRequest): Promise<SoundCheckResult> {
+  return invoke<SoundCheckResult>("run_sound_check", { request });
 }
