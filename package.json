@@ -10,5 +10,18 @@
     "tauri": "tauri",
     "tauri:build:win": "tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc",
     "tauri:build:win:gpu": "tauri build --features gpu-vulkan --runner cargo-xwin --target x86_64-pc-windows-msvc"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2",
+    "react": "18",
+    "react-dom": "18"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2",
+    "@types/react": "18",
+    "@types/react-dom": "18",
+    "@vitejs/plugin-react": "4",
+    "typescript": "5",
+    "vite": "5"
   }
 }

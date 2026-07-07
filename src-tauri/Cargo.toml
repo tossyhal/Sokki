@@ -1,0 +1,26 @@
+[package]
+name = "sokki"
+version = "0.0.0"
+description = "Local recording and transcription desktop app"
+authors = ["Sokki Contributors"]
+edition = "2021"
+license = "UNLICENSED"
+rust-version = "1.77"
+
+[lib]
+name = "sokki_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "sokki"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+
+[features]
+default = []
+gpu-vulkan = []
