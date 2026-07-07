@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cpal::Sample;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 pub const CHUNK: usize = 4096;
@@ -75,6 +76,39 @@ pub fn send_samples(
     }
 }
 
+pub fn send_converted_samples<T>(
+    samples: &[T],
+    tx: &Sender<AudioPacket>,
+    pool: &BufferPool,
+    drop_count: &AtomicU64,
+) where
+    T: cpal::Sample,
+    f32: cpal::FromSample<T>,
+{
+    let mut offset = 0;
+    while offset < samples.len() {
+        let Ok(mut buf) = pool.free_rx.try_recv() else {
+            drop_count.fetch_add((samples.len() - offset) as u64, Ordering::Relaxed);
+            return;
+        };
+
+        let len = (samples.len() - offset).min(CHUNK);
+        for (dst, src) in buf[..len].iter_mut().zip(&samples[offset..offset + len]) {
+            *dst = f32::from_sample(*src);
+        }
+        offset += len;
+
+        let packet = AudioPacket { buf, len };
+        match tx.try_send(packet) {
+            Ok(()) => {}
+            Err(TrySendError::Full(packet)) | Err(TrySendError::Disconnected(packet)) => {
+                drop_count.fetch_add(packet.len as u64, Ordering::Relaxed);
+                pool.return_buffer(packet.buf);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +143,21 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert_eq!(drop_count.load(Ordering::Relaxed), 8);
         assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn converts_integer_samples_directly_into_pooled_packet() {
+        let pool = BufferPool::with_capacity(1);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let drop_count = AtomicU64::new(0);
+
+        send_converted_samples(&[i16::MIN, 0, i16::MAX], &tx, &pool, &drop_count);
+
+        let packet = rx.try_recv().expect("converted packet should be sent");
+        assert_eq!(packet.len, 3);
+        assert_eq!(packet.buf[0], -1.0);
+        assert_eq!(packet.buf[1], 0.0);
+        assert!(packet.buf[2] > 0.99);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
     }
 }
