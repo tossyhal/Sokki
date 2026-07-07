@@ -3223,6 +3223,7 @@ name = "sokki"
 version = "0.0.0"
 dependencies = [
  "cpal",
+ "crossbeam-channel",
  "env_logger",
  "log",
  "rusqlite",
