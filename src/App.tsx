@@ -1,9 +1,11 @@
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { useEffect } from "react";
 import Library from "./pages/Library";
 import Onboarding from "./pages/Onboarding";
 import Record from "./pages/Record";
 import SessionDetail from "./pages/SessionDetail";
 import Settings from "./pages/Settings";
+import { initEventListeners } from "./lib/events";
 
 const navItems = [
   { to: "/", label: "ライブラリ" },
@@ -18,6 +20,10 @@ function navClassName({ isActive }: { isActive: boolean }) {
 }
 
 export default function App() {
+  useEffect(() => {
+    void initEventListeners();
+  }, []);
+
   return (
     <div className="flex min-h-screen bg-bg text-ink">
       <aside className="flex w-sidebar shrink-0 flex-col border-r border-line bg-surface-2 px-4 py-5">
