@@ -5,7 +5,9 @@ use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::MODELS_DIR;
 use crate::db::{Db, Session};
 use crate::error::{AppError, IO_ERROR};
-use crate::recording::{RecordingManager, RecordingStateSnapshot, StartRecordingRequest};
+use crate::recording::{
+    RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
+};
 use crate::settings::{Settings, SettingsPatch, SettingsStore};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -68,7 +70,12 @@ pub fn start_recording(
         .path()
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
-    recording_manager.start(&db, &data_dir, request)
+    recording_manager.start(
+        &db,
+        &data_dir,
+        request,
+        std::sync::Arc::new(TauriRecordingEventSink::new(app)),
+    )
 }
 
 #[tauri::command]

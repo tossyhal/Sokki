@@ -1,17 +1,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 use crate::audio::devices::{self, AudioDevice, AudioDevices};
+use crate::audio::mixer::SourceLevels;
 use crate::audio::wav::StreamingWavWriter;
 use crate::bootstrap::RECORDINGS_DIR;
 use crate::db::{Db, Language, Session, SessionStatus, Source};
 use crate::error::{
     AppError, ALREADY_RECORDING, DB_ERROR, DEVICE_NOT_FOUND, IO_ERROR, NOT_RECORDING,
 };
+
+pub const RECORDING_LEVEL_EVENT: &str = "recording://level";
+pub const RECORDING_ELAPSED_EVENT: &str = "recording://elapsed";
+pub const RECORDING_DROPS_EVENT: &str = "recording://drops";
+const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+const ELAPSED_EVENT_INTERVAL_TICKS: u64 = 5;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +41,35 @@ pub struct RecordingStateSnapshot {
     pub elapsed_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingLevelPayload {
+    pub mic: f32,
+    pub system: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingElapsedPayload {
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingDropsPayload {
+    pub drop_count: u64,
+}
+
+pub trait RecordingEventSink: Send + Sync {
+    fn emit_level(&self, payload: RecordingLevelPayload);
+    fn emit_elapsed(&self, payload: RecordingElapsedPayload);
+    fn emit_drops(&self, payload: RecordingDropsPayload);
+}
+
+pub struct TauriRecordingEventSink {
+    app: tauri::AppHandle,
+}
+
 pub struct RecordingManager {
     active: AtomicBool,
     id_counter: AtomicU64,
@@ -40,11 +78,19 @@ pub struct RecordingManager {
 
 struct ActiveRecording {
     session_id: String,
+    timing: Arc<Mutex<RecordingTiming>>,
+    writer: Option<StreamingWavWriter>,
+    levels: Arc<Mutex<RecordingLevelPayload>>,
+    drop_count: Arc<AtomicU64>,
+    event_stop_tx: mpsc::Sender<()>,
+    event_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct RecordingTiming {
     started_at: Instant,
     paused_at: Option<Instant>,
     paused_total: Duration,
-    writer: Option<StreamingWavWriter>,
-    drop_count: AtomicU64,
 }
 
 impl RecordingManager {
@@ -61,9 +107,10 @@ impl RecordingManager {
         db: &Db,
         data_dir: &Path,
         request: StartRecordingRequest,
+        events: Arc<dyn RecordingEventSink>,
     ) -> Result<String, AppError> {
         let audio_devices = devices::list_audio_devices()?;
-        self.start_with_devices(db, data_dir, request, &audio_devices)
+        self.start_with_devices(db, data_dir, request, &audio_devices, events)
     }
 
     fn start_with_devices(
@@ -72,6 +119,7 @@ impl RecordingManager {
         data_dir: &Path,
         request: StartRecordingRequest,
         audio_devices: &AudioDevices,
+        events: Arc<dyn RecordingEventSink>,
     ) -> Result<String, AppError> {
         if request.source == Source::Import {
             return Err(AppError::new(
@@ -108,13 +156,29 @@ impl RecordingManager {
         };
         db.insert_session(&session).map_err(db_error)?;
 
+        let timing = Arc::new(Mutex::new(RecordingTiming::new()));
+        let levels = Arc::new(Mutex::new(RecordingLevelPayload {
+            mic: 0.0,
+            system: 0.0,
+        }));
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (event_stop_tx, event_stop_rx) = mpsc::channel();
+        let event_thread = spawn_event_thread(
+            Arc::clone(&timing),
+            Arc::clone(&levels),
+            Arc::clone(&drop_count),
+            events,
+            event_stop_rx,
+        );
+
         *state = Some(ActiveRecording {
             session_id: session_id.clone(),
-            started_at: Instant::now(),
-            paused_at: None,
-            paused_total: Duration::ZERO,
+            timing,
             writer: Some(writer),
-            drop_count: AtomicU64::new(0),
+            levels,
+            drop_count,
+            event_stop_tx,
+            event_thread: Some(event_thread),
         });
         self.active.store(true, Ordering::SeqCst);
 
@@ -129,8 +193,12 @@ impl RecordingManager {
         let active = state
             .as_mut()
             .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
-        if active.paused_at.is_none() {
-            active.paused_at = Some(Instant::now());
+        let mut timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
+        if timing.paused_at.is_none() {
+            timing.paused_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -143,20 +211,29 @@ impl RecordingManager {
         let active = state
             .as_mut()
             .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
-        if let Some(paused_at) = active.paused_at.take() {
-            active.paused_total += paused_at.elapsed();
+        let mut timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
+        if let Some(paused_at) = timing.paused_at.take() {
+            timing.paused_total += paused_at.elapsed();
         }
         Ok(())
     }
 
     pub fn stop(&self, db: &Db) -> Result<Session, AppError> {
-        let active = self
+        let mut active = self
             .state
             .lock()
             .expect("recording state mutex should not be poisoned")
             .take()
             .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
         self.active.store(false, Ordering::SeqCst);
+
+        let _ = active.event_stop_tx.send(());
+        if let Some(event_thread) = active.event_thread.take() {
+            let _ = event_thread.join();
+        }
 
         let duration_ms = active
             .writer
@@ -185,17 +262,40 @@ impl RecordingManager {
                 elapsed_ms: 0,
             });
         };
+        let timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
 
         Ok(RecordingStateSnapshot {
             active: true,
             session_id: Some(active.session_id.clone()),
-            paused: active.paused_at.is_some(),
-            elapsed_ms: active.elapsed().as_millis() as u64,
+            paused: timing.paused_at.is_some(),
+            elapsed_ms: timing.elapsed().as_millis() as u64,
         })
     }
 
     pub fn recording_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn update_levels(&self, levels: SourceLevels) -> Result<(), AppError> {
+        let state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let active = state
+            .as_ref()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+        let mut current = active
+            .levels
+            .lock()
+            .expect("recording levels mutex should not be poisoned");
+        *current = RecordingLevelPayload {
+            mic: levels.mic,
+            system: levels.system,
+        };
+        Ok(())
     }
 
     fn next_session_id(&self) -> String {
@@ -210,7 +310,35 @@ impl Default for RecordingManager {
     }
 }
 
-impl ActiveRecording {
+impl TauriRecordingEventSink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl RecordingEventSink for TauriRecordingEventSink {
+    fn emit_level(&self, payload: RecordingLevelPayload) {
+        let _ = self.app.emit(RECORDING_LEVEL_EVENT, payload);
+    }
+
+    fn emit_elapsed(&self, payload: RecordingElapsedPayload) {
+        let _ = self.app.emit(RECORDING_ELAPSED_EVENT, payload);
+    }
+
+    fn emit_drops(&self, payload: RecordingDropsPayload) {
+        let _ = self.app.emit(RECORDING_DROPS_EVENT, payload);
+    }
+}
+
+impl RecordingTiming {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            paused_at: None,
+            paused_total: Duration::ZERO,
+        }
+    }
+
     fn elapsed(&self) -> Duration {
         let paused = self
             .paused_at
@@ -221,6 +349,52 @@ impl ActiveRecording {
             .saturating_sub(self.paused_total)
             .saturating_sub(paused)
     }
+}
+
+fn spawn_event_thread(
+    timing: Arc<Mutex<RecordingTiming>>,
+    levels: Arc<Mutex<RecordingLevelPayload>>,
+    drop_count: Arc<AtomicU64>,
+    events: Arc<dyn RecordingEventSink>,
+    stop_rx: mpsc::Receiver<()>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tick_count = 0;
+        let mut last_drop_count = 0;
+        loop {
+            match stop_rx.recv_timeout(LEVEL_EVENT_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            tick_count += 1;
+            let timing = timing
+                .lock()
+                .expect("recording timing mutex should not be poisoned");
+            let paused = timing.paused_at.is_some();
+            let elapsed_ms = timing.elapsed().as_millis() as u64;
+            drop(timing);
+
+            if !paused {
+                let level = *levels
+                    .lock()
+                    .expect("recording levels mutex should not be poisoned");
+                events.emit_level(level);
+            }
+
+            if tick_count % ELAPSED_EVENT_INTERVAL_TICKS == 0 {
+                events.emit_elapsed(RecordingElapsedPayload { elapsed_ms });
+            }
+
+            let current_drop_count = drop_count.load(Ordering::Relaxed);
+            if current_drop_count > last_drop_count {
+                last_drop_count = current_drop_count;
+                events.emit_drops(RecordingDropsPayload {
+                    drop_count: current_drop_count,
+                });
+            }
+        }
+    })
 }
 
 fn recording_wav_path(data_dir: &Path, session_id: &str) -> PathBuf {
@@ -298,6 +472,8 @@ fn validate_device(
 mod tests {
     use super::*;
     use crate::db::{Db, Language, SessionStatus, Source};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration as StdDuration;
 
     #[test]
     fn start_recording_inserts_recording_session_and_sets_active() {
@@ -317,6 +493,7 @@ mod tests {
                     loopback_device: None,
                 },
                 &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
             )
             .unwrap();
 
@@ -342,10 +519,22 @@ mod tests {
         };
 
         manager
-            .start_with_devices(&db, &data_dir, request.clone(), &sample_devices())
+            .start_with_devices(
+                &db,
+                &data_dir,
+                request.clone(),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
             .unwrap();
         let error = manager
-            .start_with_devices(&db, &data_dir, request, &sample_devices())
+            .start_with_devices(
+                &db,
+                &data_dir,
+                request,
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, crate::error::ALREADY_RECORDING);
@@ -363,6 +552,7 @@ mod tests {
                 &data_dir,
                 sample_request(Source::Mic),
                 &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
             )
             .unwrap();
 
@@ -387,6 +577,7 @@ mod tests {
                 &data_dir,
                 sample_request(Source::Mic),
                 &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
             )
             .unwrap();
 
@@ -410,6 +601,7 @@ mod tests {
                 &data_dir,
                 sample_request(Source::Mix),
                 &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
             )
             .unwrap();
 
@@ -428,7 +620,13 @@ mod tests {
         };
 
         let error = manager
-            .start_with_devices(&db, &data_dir, request, &sample_devices())
+            .start_with_devices(
+                &db,
+                &data_dir,
+                request,
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, crate::error::DEVICE_NOT_FOUND);
@@ -447,11 +645,61 @@ mod tests {
         };
 
         let error = manager
-            .start_with_devices(&db, &data_dir, sample_request(Source::System), &devices)
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::System),
+                &devices,
+                Arc::new(TestRecordingEventSink::default()),
+            )
             .unwrap_err();
 
         assert_eq!(error.code, crate::error::DEVICE_NOT_FOUND);
         assert!(!manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn emits_recording_level_and_elapsed_events_while_active() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("emits_recording_level_and_elapsed_events_while_active");
+        let manager = RecordingManager::new();
+        let events = Arc::new(TestRecordingEventSink::default());
+
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                events.clone(),
+            )
+            .unwrap();
+        manager
+            .update_levels(SourceLevels {
+                mic: 0.25,
+                system: 0.0,
+            })
+            .unwrap();
+
+        wait_until(StdDuration::from_secs(2), || {
+            events
+                .levels
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|level| level.mic == 0.25)
+                && !events.elapsed.lock().unwrap().is_empty()
+        });
+
+        assert!(events
+            .levels
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|level| level.mic == 0.25));
+        assert!(!events.elapsed.lock().unwrap().is_empty());
+        manager.stop(&db).unwrap();
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 
@@ -485,5 +733,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[derive(Default)]
+    struct TestRecordingEventSink {
+        levels: StdMutex<Vec<RecordingLevelPayload>>,
+        elapsed: StdMutex<Vec<RecordingElapsedPayload>>,
+        drops: StdMutex<Vec<RecordingDropsPayload>>,
+    }
+
+    impl RecordingEventSink for TestRecordingEventSink {
+        fn emit_level(&self, payload: RecordingLevelPayload) {
+            self.levels.lock().unwrap().push(payload);
+        }
+
+        fn emit_elapsed(&self, payload: RecordingElapsedPayload) {
+            self.elapsed.lock().unwrap().push(payload);
+        }
+
+        fn emit_drops(&self, payload: RecordingDropsPayload) {
+            self.drops.lock().unwrap().push(payload);
+        }
+    }
+
+    fn wait_until(timeout: StdDuration, mut condition: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
     }
 }

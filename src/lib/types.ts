@@ -75,3 +75,16 @@ export interface RecordingState {
   paused: boolean;
   elapsedMs: number;
 }
+
+export interface RecordingLevelEvent {
+  mic: number;
+  system: number;
+}
+
+export interface RecordingElapsedEvent {
+  elapsedMs: number;
+}
+
+export interface RecordingDropsEvent {
+  dropCount: number;
+}
