@@ -1,6 +1,6 @@
 <!--
 This is the authoritative implementation specification for Sokki v1.
-AGENT.md contains implementation rules for autonomous agents.
+AGENTS.md contains implementation rules for autonomous agents.
 README.md contains the human-facing project overview and setup notes.
 -->
 
@@ -44,6 +44,7 @@ README.md contains the human-facing project overview and setup notes.
 | 文字起こしモード | **リアルタイム(録音中逐次表示)と録音後一括の両対応** |
 | 録音ソース | **マイク / システム音声(WASAPIループバック)/ 両方ミックス** を選択可能 |
 | GPU | ビルド: cargo feature で GPU(Vulkan)分離、CPU単体ビルド必須成立。実行: `gpu_mode`(auto / force_cpu / force_gpu) |
+| 開発環境 | **WSL2 Linux を正規開発環境**とし、Windows向けは `cargo-xwin` で `x86_64-pc-windows-msvc` にクロスビルドする。WSL2でLinux Tauriターゲットはビルドしない |
 | 対象言語 | **日本語 / 英語 / 自動判別** |
 | モデル | アプリに同梱せず、**ユーザーが選択したモデルのみ**初回起動時等にDL(SHA-256検証)。Onboarding既定選択は **medium-q5_0**(バランス推奨) |
 | 付加機能(v1) | 音声ファイルのインポート文字起こし、エクスポート(txt / srt / md)、音声テスト |
@@ -131,7 +132,7 @@ rubato = "0.15"
 crossbeam-channel = "0.5"
 whisper-rs = { version = "0.16" }
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "flac", "wav", "ogg", "vorbis"] }
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
@@ -144,7 +145,9 @@ sysinfo = "0.30"
 
 - **本仕様のバージョン指定を正とする。** 実装中にAPI不整合が出た場合、勝手に最新版へ上げず、まず**指定バージョンのdocsに合わせて実装**する。
 - どうしても変更が必要な場合のみ、README にバージョンと理由を記録して Cargo.toml / Cargo.lock を更新する。
-- **Cargo.lock / package-lock.json は必ずコミットする。**
+- フロントエンド依存を変更した場合は `pnpm-lock.yaml` の変更も同じコミットに含める。
+- **Cargo.lock / pnpm-lock.yaml は必ずコミットする。**
+- `package-lock.json` は使用しない。
 
 ### 1.4 GPU方針
 ```toml
@@ -152,12 +155,21 @@ sysinfo = "0.30"
 default = []
 gpu-vulkan = ["whisper-rs/vulkan"]
 ```
-- **開発・CIビルドはデフォルト(CPUのみ)で必ず通ること**。リリースは `cargo tauri build --features gpu-vulkan`(要 Vulkan SDK。READMEに導入手順)。
+- **開発・CIビルドはデフォルト(CPUのみ)で必ず通ること**。WSL2 cross build の必須受け入れ対象は CPU版 NSIS installer とする。
+- `gpu-vulkan` feature 付きのクロスビルドは任意検証とし、失敗してもMVPの受け入れをブロックしない。GPU版リリースが必要な場合は Windows ネイティブビルドを正とする。
 - 実行時は `gpu_mode` に従う:
   - `auto`: `use_gpu(true)` でロード → 失敗したら `use_gpu(false)` で再試行し、失敗理由を `gpuErrorMessage` に保持
   - `force_cpu`: 常に `use_gpu(false)`
   - `force_gpu`: `use_gpu(true)` のみ。失敗時 `WHISPER_GPU_UNAVAILABLE`
 - CPUのみビルド(`compiledGpuSupport=false`)では常にCPU動作とし、設定UIで gpu 系選択肢を無効表示。
+
+### 1.5 開発・ビルド環境
+
+WSL2 Linux を正規の開発環境とする。ただし、このプロジェクトは Windows 10/11 x64 専用であり、WSL2上で plain `cargo tauri build` を実行して Linux Tauri ターゲットをビルドすることは禁止する。
+
+WSL2では `cargo-xwin` による `x86_64-pc-windows-msvc` ターゲットのみを正規ビルド対象とする。Linux Tauri 用の `dbus` / GTK / WebKitGTK 依存は導入しない。
+
+WSL2からの `tauri dev` は正規の実行確認パスではない。WSL2ではWindows向け成果物をビルドし、生成されたWindows実行ファイルまたはNSISインストーラーをWindows上で実行確認する。
 
 ---
 
@@ -661,7 +673,7 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 
 | MS | 内容 | 節目基準 |
 |---|---|---|
-| M1 | スキャフォールド | dev起動、全ページ骨組み、get_system_info疎通 |
+| M1 | スキャフォールド | Windows向けクロスビルド経路、全ページ骨組み、get_system_info疎通 |
 | M2 | DB・設定・モデル管理・Onboarding | DL+SHA検証、usable判定、Onboarding完走 |
 | M3 | 録音+音声テスト | 3ソース録音・**再生ゲート通過**、サウンドチェック、復旧 |
 | M4 | ジョブ基盤+バッチ文字起こし+エクスポート | 15秒チャンク、重複除去、per-file import、srt確認 |
@@ -704,8 +716,8 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 - [ ] 録音中強制終了→再起動で interrupted+WAV修復され、再文字起こしできる
 - [ ] **transcribing中強制終了→再起動で interrupted になり、詳細画面から再文字起こしできる**
 - [ ] モデル未DL・デバイス切断・重複起動・ディスクフル(可能なら)でクラッシュせず案内が出る
-- [ ] `cargo tauri build`(CPUのみ)が Vulkan SDK なしで成功し、Cargo.lock がコミットされている
-- [ ] GPUビルド手順が README に記載されている
+- [ ] `pnpm tauri:build:win` による CPU版NSISクロスビルドが Vulkan SDK なしで成功し、Cargo.lock / pnpm-lock.yaml がコミットされている
+- [ ] GPUクロスビルドは任意検証であり、MVP受け入れゲートではないことが README に記載されている
 
 ---
 
@@ -719,15 +731,21 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 
 **運用規則**
 - 以下の順で実装し、**1項目=1コミット**。メッセージは記載の英語をそのまま使う(Conventional Commits)。
-- 各コミット前に `cargo check` と `npm run build` を通す。UIを含むコミットは `npm run tauri dev` で目視確認。
-- Cargo.lock / package-lock.json の変更は必ず同コミットに含める。
+- 各コミット前に以下をWSL2上で実行する。
+  - `pnpm build`
+  - `cd src-tauri && cargo fmt --check`
+  - `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc`
+  - `cd src-tauri && cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
+- `cargo xwin clippy` が cargo-xwin 側の制約で動作しない場合のみ、その理由を README に記録し、`cargo xwin check` を必須ゲート、clippy は Windows ネイティブまたは CI での補助ゲートとする。
+- `pnpm-lock.yaml` と `Cargo.lock` は必ずコミットする。
+- `package-lock.json` は使用しない。
 - 先行コミットとの整合が崩れる場合は当該コミット内で修正する(仕様が正)。
 
 ### M1: スキャフォールド
 
 1. `chore: initialize tauri v2 project with react-ts template`
-   - create-tauri-app(React+TS+Vite)。identifier=com.sokki.app、ウィンドウ設定。Cargo.lock/package-lock.json をコミット。
-   - 完了条件: `npm run tauri dev` でウィンドウ表示。
+   - create-tauri-app(React+TS+Vite)。identifier=com.sokki.app、ウィンドウ設定。Cargo.lock/pnpm-lock.yaml をコミット。
+   - 完了条件: WSL2上で `pnpm build` と `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc` が通る。
 2. `chore: add tailwind css with confirmed design tokens`
    - Tailwind、**§8.4 の確定トークンを theme.extend にそのまま設定**、Inter/Noto Sans JP ローカルバンドル(CDN禁止)、tabular-nums。
 3. `feat: add rust error type and logging setup`
@@ -851,9 +869,9 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 59. `fix: audit event listeners and store updates for duplicates`
     - StrictMode二重購読・リーク・session://status の一覧/詳細反映漏れの監査。
 60. `chore: configure nsis bundle target`
-    - `cargo tauri build`(CPU)成功確認。
+    - `pnpm tauri:build:win` による CPU版NSISクロスビルド成功確認。
 61. `docs: add readme with build and release instructions`
-    - CPU/GPUビルド(Vulkan SDK)、配布手順、既知の制限(デバイス名ID、時刻同期ベストエフォート、abort不可時の15秒待ち等)、手動テスト手順、依存バージョン変更履歴。
+    - CPU版NSISクロスビルド、GPU任意検証、配布手順、既知の制限(デバイス名ID、時刻同期ベストエフォート、abort不可時の15秒待ち等)、手動テスト手順、依存バージョン変更履歴。
 62. `chore: verify acceptance checklist and tag v1.0.0`
     - §13 全項目の確認結果を docs/acceptance.md に記録。
 
@@ -863,11 +881,13 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 
 - Tauri は **v2 API のみ**(v1 の `tauri::api::*`・allowlist 記法禁止)。
 - フロントから直接FSを触らない。パスは常にRust生成の絶対パス+`convertFileSrc()`。
-- **依存バージョンは §1.3 の指定が正。勝手に上げない。Cargo.lock/package-lock.json をコミットする。**
+- **依存バージョンは §1.3 の指定が正。勝手に上げない。Cargo.lock/pnpm-lock.yaml をコミットする。**
 - **audio callback 内での `Vec` 新規確保・Mutexロック・ログ・emit 禁止**(§5.2)。
 - **バッチは15秒以下チャンク+abort callback 必須**(§1.2, §6.4)。音声全体1ジョブ禁止。リアルタイムは最大8秒チャンク(§5.5)。
 - **デザインモック(Sokki.html)のコードは流用禁止**。§8.4 トークンで新規実装し、見た目のみ踏襲(§8.5)。
 - **stop_recording で Whisper 完了を待たない**(§4.1)。done 遷移は JobTracker のみが行う。
 - **オーバーラップ結果は valid 範囲でクリップ**(§6.3.1)。
 - **M3 の再生ゲート(§9)を通過するまで先へ進まない。**
-- コミットは §15 の順・粒度・メッセージに従い、各コミットで `cargo check` / `npm run build` を通す。
+- WSL2上でLinux向けTauriビルドを正規ゲートにしない。`dbus` / GTK / WebKitGTK 依存をこのプロジェクトのために導入しない。
+- WSL2からの `tauri dev` は正規の実行確認パスではない。Windows向け成果物をビルドし、Windows上で実機確認する。
+- コミットは §15 の順・粒度・メッセージに従い、各コミットで `pnpm build` / `cargo xwin check` を通す。

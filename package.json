@@ -1,0 +1,14 @@
+{
+  "name": "sokki",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri",
+    "tauri:build:win": "tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc",
+    "tauri:build:win:gpu": "tauri build --features gpu-vulkan --runner cargo-xwin --target x86_64-pc-windows-msvc"
+  }
+}

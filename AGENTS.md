@@ -1,29 +1,103 @@
-# AGENT.md
+# AGENTS.md
 
-このファイルは、Sokki を実装するエージェント向けの作業規約です。詳細仕様の正は [`spec.md`](docs/spec.md) です。`README.md` は人間向けの概要・セットアップ・利用説明です。
+このファイルは、Sokki を実装するエージェント向けの作業規約です。詳細仕様の正は [`docs/spec.md`](docs/spec.md) です。`README.md` は人間向けの概要・セットアップ・利用説明です。
+
+## プロジェクト方針
+
+Sokki は Windows 10/11 x64 専用の Tauri v2 デスクトップアプリです。
+WSL2 を正規の開発環境としますが、Tauri を Linux デスクトップアプリとしてビルドしてはいけません。
+
+WSL2上で plain `cargo tauri build` を実行して Linux ターゲットをビルドすることは禁止します。
+`dbus`、GTK、WebKitGTK などの Linux Tauri デスクトップ依存を、このプロジェクトのために導入しないでください。
+
+正規のWindowsターゲットは以下です。
+
+- `x86_64-pc-windows-msvc`
+- NSIS installer のみ
+- `cargo-xwin` によるクロスビルド
+
+WSL2からの `tauri dev` は正規の実行確認パスではありません。
+WSL2ではWindows向け成果物をビルドし、生成されたWindows実行ファイルまたはNSISインストーラーをWindows上で実行確認します。
 
 ## 最優先ルール
 
-1. **`spec.md` を正とする。** 迷ったら `spec.md` の決定に従う。
-2. **v1では翻訳・話者分離・AI要約・全文検索・編集・静音モードは実装しない。** 将来拡張を阻害しない構造に留める。
+1. **`docs/spec.md` を正とする。** 迷ったら `docs/spec.md` の決定に従う。
+2. **v1では翻訳・話者分離・AI要約・全文検索・編集は実装しない。** 将来拡張を阻害しない構造に留める。
 3. **完全ローカル方針を守る。** 外部通信はモデルダウンロードとモデル検証用の Hugging Face API のみ。
 4. **Windows 10/11 x64 のみを対象にする。** 他OS対応の分岐や抽象化を勝手に増やさない。
 5. **Tauri v2 APIのみ使用する。** v1 の `tauri::api::*` や allowlist 記法は禁止。
 6. **フロントエンドから直接ファイルシステムへ触らない。** ファイル操作はRustコマンド経由に限定する。
-7. **依存バージョンは `spec.md` §1.3 を正とする。** 勝手に最新版へ上げない。変更が必要な場合はREADMEに理由を残し、`Cargo.toml` / `Cargo.lock` を同時更新する。
-8. **`Cargo.lock` と `package-lock.json` は必ずコミットする。**
-9. **コミット順・粒度・メッセージは `spec.md` §15 に従う。** 1項目=1コミットを原則にする。
-10. **各コミット前にビルド・lint・formatを通す。** 少なくとも以下を実行する。
+7. **依存バージョンは `docs/spec.md` §1.3 を正とする。** 勝手に最新版へ上げない。変更が必要な場合はREADMEに理由を残し、`Cargo.toml` / `Cargo.lock` を同時更新する。
+8. **`Cargo.lock` と `pnpm-lock.yaml` は必ずコミットする。**
+9. **コミット順・粒度・メッセージは `docs/spec.md` §15 に従う。** 1項目=1コミットを原則にする。
+10. **各コミット前にビルド・lint・formatを通す。** §15 の運用規則に従う。
+
+## WSL2セットアップ
+
+WSL2 Ubuntuでは以下を用意します。
 
 ```bash
-npm run build
-cd src-tauri
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo check
+sudo apt update
+sudo apt install -y \
+  build-essential curl wget file pkg-config libssl-dev \
+  clang lld llvm cmake ninja-build nsis
+
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+corepack enable
+pnpm --version
 ```
 
-UIを含むコミットでは `npm run tauri dev` で目視確認も行う。
+## パッケージマネージャ
+
+このプロジェクトでは `pnpm` のみを使います。
+
+- `npm` は使わない
+- `package-lock.json` はコミットしない
+- `pnpm-lock.yaml` は必ずコミットする
+- フロントエンド依存を変更した場合は `pnpm-lock.yaml` の変更も同じコミットに含める
+
+## 各コミット前の必須チェック
+
+各コミット前にWSL2上で以下を実行します。
+
+```bash
+pnpm build
+
+cd src-tauri
+cargo fmt --check
+cargo xwin check --target x86_64-pc-windows-msvc
+cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
+
+`cargo xwin clippy` が `cargo-xwin` 側の制約で動作しない場合のみ、その理由を `README.md` に記録し、`cargo xwin check` を必須ゲート、clippy は Windows ネイティブまたは CI での補助ゲートとします。
+
+## Windows向けビルド
+
+正規のWindows向けNSISビルドは以下です。
+
+```bash
+pnpm tauri:build:win
+```
+
+出力先:
+
+```text
+src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
+```
+
+## 実機確認
+
+WSL2でのクロスビルド完了後、以下はWindows上で確認します。
+
+- 生成された `.exe` が起動する
+- NSIS installer からインストールできる
+- WebView2 が動作する
+- マイク録音できる
+- WASAPI loopback でシステム音声を録音できる
+- マイク + システム音声ミックス録音ができる
+- 録音WAVとサウンドチェックWAVをWebViewから再生できる
+- assetProtocol scope が正しく機能する
 
 ## 実装対象の境界
 
@@ -56,7 +130,6 @@ UIを含むコミットでは `npm run tauri dev` で目視確認も行う。
 - 自動アップデータ
 - 永続ジョブキュー
 - mic-system厳密時刻同期
-- 静音モード / パフォーマンスプリセット
 
 ## 絶対に破ってはいけない技術制約
 
@@ -87,13 +160,11 @@ callbackでは、事前確保済みの固定長バッファへコピーし、loc
 - リアルタイムSegmenterは最大8秒で強制確定する。
 - 8秒強制確定時は次チャンク先頭に600msオーバーラップを付ける。
 - オーバーラップとプリロールは認識安定化のためだけに使い、DB保存は `valid_start_ms / valid_end_ms` の範囲に限定する。
-- 同一発話の二重セグメントを避けるため、`spec.md` §6.3.1 の重複抑制を実装する。
+- 同一発話の二重セグメントを避けるため、`docs/spec.md` §6.3.1 の重複抑制を実装する。
 
 ### stop_recording
 
 `stop_recording` はWhisper完了を待ってはならない。
-
-手順は以下。
 
 1. Mixer / capture停止
 2. Segmenter flush
@@ -130,7 +201,7 @@ migration直後に以下を実行する。
 
 ## デザイン実装ルール
 
-- デザインの正は `spec.md` §8.4 のトークン。
+- デザインの正は `docs/spec.md` §8.4 のトークン。
 - Claude Design由来の `Sokki.html` は視覚参照のみ。コード流用は禁止。
 - Google Fonts等のCDN参照は禁止。Inter / Noto Sans JP はローカルバンドルする。
 - アクセント色 `#C4453F` はRECドット、主アクション、文字起こし中バッジ、再生位置ハイライトに限定する。
@@ -139,7 +210,7 @@ migration直後に以下を実行する。
 
 ## 実装順
 
-正確なコミット計画は `spec.md` §15 に従う。大枠は以下。
+正確なコミット計画は `docs/spec.md` §15 に従う。大枠は以下。
 
 1. M1: スキャフォールド
 2. M2: DB・設定・モデル管理・Onboarding
@@ -150,9 +221,9 @@ migration直後に以下を実行する。
 
 ## チェックリスト
 
-各段階で `spec.md` §13 の受け入れ基準を満たすこと。特に以下はゲート扱いにする。
+各段階で `docs/spec.md` §13 の受け入れ基準を満たすこと。特に以下はゲート扱いにする。
 
-- CPUのみビルドがVulkan SDKなしで成功する
+- CPU版NSISクロスビルドがVulkan SDKなしで成功する
 - モデルDL後にSHA-256検証される
 - マイク / システム音声 / ミックスの3構成で録音できる
 - サウンドチェックWAVと録音WAVがWebViewで再生できる
@@ -162,3 +233,19 @@ migration直後に以下を実行する。
 - `transcribing` 中に強制終了しても次回起動で `interrupted` になる
 - srtがVLC等で読み込める
 - NSISビルドが成功する
+
+## 禁止事項
+
+- WSL2上でLinux向けTauriビルドを正規ゲートにしない
+- `dbus` / GTK / WebKitGTK 依存をこのプロジェクトのために入れない
+- `npm install` を使わない
+- `package-lock.json` を作らない
+- `tauri dev` from WSL2 を正規の実行確認にしない
+- v1仕様にない機能を勝手に追加しない
+
+## GPUビルド
+
+MVPの必須受け入れ対象はCPU版NSIS installerです。
+
+`gpu-vulkan` feature付きのクロスビルドは任意検証とし、失敗してもMVPの受け入れをブロックしません。
+GPU版リリースが必要な場合は、Windowsネイティブビルドを正とします。
