@@ -12,6 +12,8 @@
     "tauri:build:win:gpu": "tauri build --features gpu-vulkan --runner cargo-xwin --target x86_64-pc-windows-msvc"
   },
   "dependencies": {
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/noto-sans-jp": "^5.2.9",
     "@tauri-apps/api": "2",
     "react": "18",
     "react-dom": "18"
@@ -21,6 +23,9 @@
     "@types/react": "18",
     "@types/react-dom": "18",
     "@vitejs/plugin-react": "4",
+    "autoprefixer": "^10.5.2",
+    "postcss": "^8.5.16",
+    "tailwindcss": "^3.4.19",
     "typescript": "5",
     "vite": "5"
   }
