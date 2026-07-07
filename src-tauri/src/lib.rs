@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod import;
 pub mod recording;
 pub mod recovery;
 pub mod settings;
