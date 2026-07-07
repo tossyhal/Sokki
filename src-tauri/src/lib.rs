@@ -7,6 +7,7 @@ pub mod recording;
 pub mod recovery;
 pub mod settings;
 pub mod sound_check;
+pub mod transcription;
 
 use tauri::Manager;
 
