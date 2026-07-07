@@ -1,6 +1,7 @@
 use serde::Serialize;
 use tauri::Manager;
 
+use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::MODELS_DIR;
 use crate::error::{AppError, IO_ERROR};
 use crate::settings::{Settings, SettingsPatch, SettingsStore};
@@ -47,6 +48,11 @@ pub fn update_settings(
     patch: SettingsPatch,
 ) -> Result<Settings, AppError> {
     settings_store.update(patch)
+}
+
+#[tauri::command]
+pub fn list_audio_devices() -> Result<AudioDevices, AppError> {
+    devices::list_audio_devices()
 }
 
 #[cfg(test)]

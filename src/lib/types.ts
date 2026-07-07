@@ -28,3 +28,14 @@ export interface Settings {
   onboardingDone: boolean;
   soundCheckRecommended: boolean;
 }
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
+export interface AudioDevices {
+  inputs: AudioDevice[];
+  outputs: AudioDevice[];
+}
