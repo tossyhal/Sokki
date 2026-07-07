@@ -8,37 +8,44 @@ use crate::error::{AppError, DB_ERROR, IO_ERROR};
 use crate::recording::{
     RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
 };
-use crate::settings::{Settings, SettingsPatch, SettingsStore};
+use crate::settings::{GpuMode, Settings, SettingsPatch, SettingsStore};
 use crate::sound_check::{
     SoundCheckManager, SoundCheckRequest, SoundCheckResult, TauriSoundCheckEventSink,
 };
+use crate::transcription::context::{ActiveBackend, WhisperContextManager};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemInfo {
     pub app_version: String,
     pub compiled_gpu_support: bool,
-    pub requested_backend: String,
-    pub active_backend: String,
+    pub requested_backend: GpuMode,
+    pub active_backend: ActiveBackend,
     pub gpu_error_message: Option<String>,
     pub models_dir: String,
     pub data_dir: String,
 }
 
 #[tauri::command]
-pub fn get_system_info(app: tauri::AppHandle) -> Result<SystemInfo, AppError> {
+pub fn get_system_info(
+    app: tauri::AppHandle,
+    settings_store: tauri::State<'_, SettingsStore>,
+    whisper_context: tauri::State<'_, WhisperContextManager>,
+) -> Result<SystemInfo, AppError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
     let models_dir = data_dir.join(MODELS_DIR);
+    let settings = settings_store.load()?;
+    let runtime = whisper_context.runtime_info(settings.gpu_mode);
 
     Ok(SystemInfo {
         app_version: app.package_info().version.to_string(),
-        compiled_gpu_support: cfg!(feature = "gpu-vulkan"),
-        requested_backend: "auto".to_string(),
-        active_backend: "none".to_string(),
-        gpu_error_message: None,
+        compiled_gpu_support: runtime.compiled_gpu_support,
+        requested_backend: runtime.requested_backend,
+        active_backend: runtime.active_backend,
+        gpu_error_message: runtime.gpu_error_message,
         models_dir: models_dir.display().to_string(),
         data_dir: data_dir.display().to_string(),
     })
@@ -197,8 +204,8 @@ mod tests {
         let info = SystemInfo {
             app_version: "0.0.0".to_string(),
             compiled_gpu_support: false,
-            requested_backend: "auto".to_string(),
-            active_backend: "none".to_string(),
+            requested_backend: GpuMode::Auto,
+            active_backend: ActiveBackend::None,
             gpu_error_message: None,
             models_dir: "C:/Users/example/AppData/Roaming/com.sokki.app/models".to_string(),
             data_dir: "C:/Users/example/AppData/Roaming/com.sokki.app".to_string(),

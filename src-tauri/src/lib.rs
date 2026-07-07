@@ -29,6 +29,7 @@ pub fn run() {
             app.manage(recording::RecordingManager::new());
             app.manage(settings::SettingsStore::at_data_dir(&data_dir));
             app.manage(sound_check::SoundCheckManager::new());
+            app.manage(transcription::context::WhisperContextManager::new());
             log::info!("Sokki app data directory: {}", data_dir.display());
             Ok(())
         })

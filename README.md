@@ -36,13 +36,15 @@ WSL2ではWindows向け成果物をビルドし、生成されたWindows実行�
 sudo apt update
 sudo apt install -y \
   build-essential curl wget file pkg-config libssl-dev \
-  clang lld llvm cmake ninja-build nsis
+  clang-19 lld-19 llvm-19 cmake ninja-build nsis
 
 rustup target add x86_64-pc-windows-msvc
 cargo install --locked cargo-xwin
 corepack enable
 pnpm --version
 ```
+
+`whisper-rs` がビルドする `whisper.cpp` は、cargo-xwin の MSVC STL との組み合わせで Clang 19 以上を必要とします。
 
 Linux向けTauriビルド用に `dbus`、GTK、WebKitGTK を入れる方針にはしません。
 
