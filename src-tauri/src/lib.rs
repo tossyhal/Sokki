@@ -4,6 +4,7 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod recording;
+pub mod recovery;
 pub mod settings;
 pub mod sound_check;
 
@@ -18,7 +19,12 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             bootstrap::ensure_app_data_dirs(&data_dir)?;
-            app.manage(db::Db::open(data_dir.join("sokki.db"))?);
+            let db = db::Db::open(data_dir.join("sokki.db"))?;
+            let recovered = recovery::recover_interrupted_sessions(&db, &data_dir)?;
+            if recovered > 0 {
+                log::info!("Recovered {recovered} interrupted session(s)");
+            }
+            app.manage(db);
             app.manage(recording::RecordingManager::new());
             app.manage(settings::SettingsStore::at_data_dir(&data_dir));
             app.manage(sound_check::SoundCheckManager::new());
