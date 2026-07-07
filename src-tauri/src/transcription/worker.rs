@@ -1,0 +1,557 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
+
+use crate::db::{Db, NewSegment, SessionStatus};
+use crate::error::{AppError, DB_ERROR};
+use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
+pub enum JobProcessResult {
+    Completed { segments: Vec<NewSegment> },
+    Aborted,
+}
+
+pub trait JobProcessor: Send + Sync + 'static {
+    fn process(
+        &self,
+        job: &TranscribeJob,
+        should_abort: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<JobProcessResult, AppError>;
+}
+
+pub struct NoopJobProcessor;
+
+impl JobProcessor for NoopJobProcessor {
+    fn process(
+        &self,
+        _job: &TranscribeJob,
+        should_abort: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<JobProcessResult, AppError> {
+        if should_abort() {
+            Ok(JobProcessResult::Aborted)
+        } else {
+            Ok(JobProcessResult::Completed {
+                segments: Vec::new(),
+            })
+        }
+    }
+}
+
+pub struct TranscribeWorkerHandle {
+    rt_tx: Sender<TranscribeJob>,
+    batch_tx: Sender<TranscribeJob>,
+    shutdown_tx: Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TranscribeWorkerHandle {
+    pub fn start(
+        db: Arc<Db>,
+        tracker: Arc<JobTracker>,
+        recording_active: Arc<AtomicBool>,
+        processor: Arc<dyn JobProcessor>,
+    ) -> Self {
+        let (rt_tx, rt_rx) = unbounded();
+        let (batch_tx, batch_rx) = unbounded();
+        let (shutdown_tx, shutdown_rx) = unbounded();
+        let thread = spawn_worker_loop(WorkerRuntime {
+            rt_rx,
+            batch_rx,
+            shutdown_rx,
+            db,
+            tracker,
+            recording_active,
+            processor,
+        });
+
+        Self {
+            rt_tx,
+            batch_tx,
+            shutdown_tx,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn enqueue_rt(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.rt_tx
+            .send(job)
+            .map_err(|_| AppError::new(DB_ERROR, "transcription worker is stopped"))
+    }
+
+    pub fn enqueue_batch(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.batch_tx
+            .send(job)
+            .map_err(|_| AppError::new(DB_ERROR, "transcription worker is stopped"))
+    }
+
+    pub fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for TranscribeWorkerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct WorkerRuntime {
+    rt_rx: Receiver<TranscribeJob>,
+    batch_rx: Receiver<TranscribeJob>,
+    shutdown_rx: Receiver<()>,
+    db: Arc<Db>,
+    tracker: Arc<JobTracker>,
+    recording_active: Arc<AtomicBool>,
+    processor: Arc<dyn JobProcessor>,
+}
+
+fn spawn_worker_loop(runtime: WorkerRuntime) -> JoinHandle<()> {
+    thread::spawn(move || run_worker_loop(runtime))
+}
+
+fn run_worker_loop(runtime: WorkerRuntime) {
+    let mut deferred: Option<TranscribeJob> = None;
+
+    loop {
+        if runtime.shutdown_rx.try_recv().is_ok() {
+            break;
+        }
+
+        if let Ok(job) = runtime.rt_rx.try_recv() {
+            process_or_finish(&runtime, job, &mut deferred);
+            continue;
+        }
+
+        if runtime.recording_active.load(Ordering::SeqCst) {
+            if wait_for_shutdown(&runtime.shutdown_rx) {
+                break;
+            }
+            continue;
+        }
+
+        if let Some(job) = deferred.take() {
+            if job.canceled() {
+                let _ = runtime.tracker.finish(
+                    &runtime.db,
+                    &job.session_id,
+                    runtime.recording_active.load(Ordering::SeqCst),
+                );
+            } else {
+                process_or_finish(&runtime, job, &mut deferred);
+            }
+            continue;
+        }
+
+        select! {
+            recv(runtime.shutdown_rx) -> _ => break,
+            recv(runtime.rt_rx) -> job => {
+                if let Ok(job) = job {
+                    process_or_finish(&runtime, job, &mut deferred);
+                }
+            }
+            recv(runtime.batch_rx) -> job => {
+                if let Ok(job) = job {
+                    if job.canceled() {
+                        let _ = runtime.tracker.finish(
+                            &runtime.db,
+                            &job.session_id,
+                            runtime.recording_active.load(Ordering::SeqCst),
+                        );
+                    } else {
+                        process_or_finish(&runtime, job, &mut deferred);
+                    }
+                }
+            }
+            default(WORKER_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+fn wait_for_shutdown(shutdown_rx: &Receiver<()>) -> bool {
+    match shutdown_rx.recv_timeout(WORKER_POLL_INTERVAL) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+        Err(RecvTimeoutError::Timeout) => false,
+    }
+}
+
+fn process_or_finish(
+    runtime: &WorkerRuntime,
+    job: TranscribeJob,
+    deferred: &mut Option<TranscribeJob>,
+) {
+    if job.canceled() {
+        let _ = runtime.tracker.finish(
+            &runtime.db,
+            &job.session_id,
+            runtime.recording_active.load(Ordering::SeqCst),
+        );
+        return;
+    }
+
+    let should_abort =
+        || job.kind == JobKind::Batch && runtime.recording_active.load(Ordering::SeqCst);
+
+    let result = runtime.processor.process(&job, &should_abort);
+    match result {
+        Ok(JobProcessResult::Completed { segments }) => {
+            if insert_segments(&runtime.db, segments).is_err() {
+                let _ = runtime.db.update_session_status(
+                    &job.session_id,
+                    SessionStatus::Error,
+                    Some("failed to persist transcription segments"),
+                );
+            }
+            let _ = runtime.tracker.finish(
+                &runtime.db,
+                &job.session_id,
+                runtime.recording_active.load(Ordering::SeqCst),
+            );
+        }
+        Ok(JobProcessResult::Aborted) => {
+            *deferred = Some(job);
+        }
+        Err(error) => {
+            let _ = runtime.db.update_session_status(
+                &job.session_id,
+                SessionStatus::Error,
+                Some(&error.message),
+            );
+            let _ = runtime.tracker.finish(
+                &runtime.db,
+                &job.session_id,
+                runtime.recording_active.load(Ordering::SeqCst),
+            );
+        }
+    }
+}
+
+fn insert_segments(db: &Db, segments: Vec<NewSegment>) -> Result<(), AppError> {
+    for segment in segments {
+        db.insert_segment(&segment)
+            .map_err(|error| AppError::new(DB_ERROR, format!("database error: {error}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Language, Session, Source};
+    use crate::transcription::jobs::JobKind;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn rt_jobs_are_processed_before_queued_batch_jobs() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("rt-session");
+        fixture.insert_session("batch-session");
+        let processor = Arc::new(RecordingProcessor::default());
+        let (rt_tx, rt_rx) = unbounded();
+        let (batch_tx, batch_rx) = unbounded();
+        let (shutdown_tx, shutdown_rx) = unbounded();
+
+        let batch_job = fixture.job("batch-session", JobKind::Batch);
+        let rt_job = fixture.job("rt-session", JobKind::Rt);
+        batch_tx.send(batch_job).unwrap();
+        rt_tx.send(rt_job).unwrap();
+
+        let thread = spawn_worker_loop(WorkerRuntime {
+            rt_rx,
+            batch_rx,
+            shutdown_rx,
+            db: Arc::clone(&fixture.db),
+            tracker: Arc::clone(&fixture.tracker),
+            recording_active: Arc::clone(&fixture.recording_active),
+            processor: processor.clone(),
+        });
+
+        assert_eq!(
+            processor.recv_processed(),
+            ("rt-session".to_string(), JobKind::Rt)
+        );
+        assert_eq!(
+            processor.recv_processed(),
+            ("batch-session".to_string(), JobKind::Batch)
+        );
+        shutdown_tx.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn batch_jobs_wait_while_recording_is_active() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("batch-session");
+        fixture.recording_active.store(true, Ordering::SeqCst);
+        let processor = Arc::new(RecordingProcessor::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor.clone(),
+        );
+
+        worker
+            .enqueue_batch(fixture.job("batch-session", JobKind::Batch))
+            .unwrap();
+        assert!(
+            processor
+                .try_recv_processed(WORKER_POLL_INTERVAL * 2)
+                .is_none(),
+            "batch job should not start while recording is active"
+        );
+
+        fixture.recording_active.store(false, Ordering::SeqCst);
+        assert_eq!(
+            processor.recv_processed(),
+            ("batch-session".to_string(), JobKind::Batch)
+        );
+        worker.shutdown();
+    }
+
+    #[test]
+    fn aborted_batch_job_is_deferred_and_reprocessed_after_recording_stops() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("batch-session");
+        let (processed_tx, processed_rx) = processed_channel();
+        let processor = Arc::new(AbortFirstBatchProcessor {
+            processed_tx,
+            attempt: AtomicUsize::new(0),
+            recording_active: Arc::clone(&fixture.recording_active),
+        });
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+        );
+
+        worker
+            .enqueue_batch(fixture.job("batch-session", JobKind::Batch))
+            .unwrap();
+
+        assert_eq!(
+            processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first attempt should run"),
+            ("batch-session".to_string(), JobKind::Batch)
+        );
+        assert_eq!(fixture.tracker.pending_count("batch-session"), 1);
+        fixture.recording_active.store(false, Ordering::SeqCst);
+        assert_eq!(
+            processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("deferred attempt should run"),
+            ("batch-session".to_string(), JobKind::Batch)
+        );
+        eventually_done(&fixture, "batch-session");
+        worker.shutdown();
+    }
+
+    #[test]
+    fn canceled_deferred_job_is_skipped_and_finished() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("batch-session");
+        let (processed_tx, processed_rx) = processed_channel();
+        let processor = Arc::new(AbortFirstBatchProcessor {
+            processed_tx,
+            attempt: AtomicUsize::new(0),
+            recording_active: Arc::clone(&fixture.recording_active),
+        });
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+        );
+        let job = fixture.job("batch-session", JobKind::Batch);
+        let canceled = Arc::clone(&job.canceled);
+
+        worker.enqueue_batch(job).unwrap();
+        processed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first attempt should run");
+        canceled.store(true, Ordering::SeqCst);
+        fixture.recording_active.store(false, Ordering::SeqCst);
+
+        assert!(
+            processed_rx.recv_timeout(WORKER_POLL_INTERVAL * 2).is_err(),
+            "canceled deferred job should not be processed again"
+        );
+        eventually_done(&fixture, "batch-session");
+        worker.shutdown();
+    }
+
+    #[test]
+    fn canceled_rt_job_is_skipped_and_finished() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("rt-session");
+        let processor = Arc::new(RecordingProcessor::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor.clone(),
+        );
+        let job = fixture.job("rt-session", JobKind::Rt);
+        job.canceled.store(true, Ordering::SeqCst);
+
+        worker.enqueue_rt(job).unwrap();
+
+        assert!(
+            processor
+                .try_recv_processed(WORKER_POLL_INTERVAL * 2)
+                .is_none(),
+            "canceled rt job should not be processed"
+        );
+        eventually_done(&fixture, "rt-session");
+        worker.shutdown();
+    }
+
+    struct RecordingProcessor {
+        processed_tx: Sender<(String, JobKind)>,
+        processed_rx: Receiver<(String, JobKind)>,
+    }
+
+    impl Default for RecordingProcessor {
+        fn default() -> Self {
+            let (processed_tx, processed_rx) = processed_channel();
+            Self {
+                processed_tx,
+                processed_rx,
+            }
+        }
+    }
+
+    impl RecordingProcessor {
+        fn recv_processed(&self) -> (String, JobKind) {
+            self.processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("job should be processed")
+        }
+
+        fn try_recv_processed(&self, timeout: Duration) -> Option<(String, JobKind)> {
+            self.processed_rx.recv_timeout(timeout).ok()
+        }
+    }
+
+    impl JobProcessor for RecordingProcessor {
+        fn process(
+            &self,
+            job: &TranscribeJob,
+            _should_abort: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<JobProcessResult, AppError> {
+            self.processed_tx
+                .send((job.session_id.clone(), job.kind))
+                .expect("processed receiver should be open");
+            Ok(JobProcessResult::Completed {
+                segments: Vec::new(),
+            })
+        }
+    }
+
+    struct AbortFirstBatchProcessor {
+        processed_tx: Sender<(String, JobKind)>,
+        attempt: AtomicUsize,
+        recording_active: Arc<AtomicBool>,
+    }
+
+    impl JobProcessor for AbortFirstBatchProcessor {
+        fn process(
+            &self,
+            job: &TranscribeJob,
+            should_abort: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<JobProcessResult, AppError> {
+            self.processed_tx
+                .send((job.session_id.clone(), job.kind))
+                .expect("processed receiver should be open");
+            if job.kind == JobKind::Batch && self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.recording_active.store(true, Ordering::SeqCst);
+                assert!(should_abort());
+                Ok(JobProcessResult::Aborted)
+            } else {
+                Ok(JobProcessResult::Completed {
+                    segments: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn processed_channel() -> (Sender<(String, JobKind)>, Receiver<(String, JobKind)>) {
+        unbounded()
+    }
+
+    struct WorkerFixture {
+        db: Arc<Db>,
+        tracker: Arc<JobTracker>,
+        recording_active: Arc<AtomicBool>,
+    }
+
+    impl WorkerFixture {
+        fn new() -> Self {
+            Self {
+                db: Arc::new(Db::open_in_memory().unwrap()),
+                tracker: Arc::new(JobTracker::new()),
+                recording_active: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn insert_session(&self, id: &str) {
+            self.db
+                .insert_session(&Session {
+                    id: id.to_string(),
+                    title: id.to_string(),
+                    created_at: 1_000,
+                    duration_ms: 0,
+                    audio_path: None,
+                    source: Source::Import,
+                    language: Language::Ja,
+                    model: "medium-q5_0".to_string(),
+                    status: SessionStatus::Transcribing,
+                    error_message: None,
+                    drop_count: 0,
+                })
+                .unwrap();
+        }
+
+        fn job(&self, session_id: &str, kind: JobKind) -> TranscribeJob {
+            let canceled = self.tracker.enqueue(session_id);
+            TranscribeJob {
+                session_id: session_id.to_string(),
+                kind,
+                audio: vec![0.0; 160],
+                chunk_start_ms: 0,
+                valid_start_ms: 0,
+                valid_end_ms: 10,
+                language: Language::Ja,
+                model: "medium-q5_0".to_string(),
+                canceled,
+            }
+        }
+    }
+
+    fn eventually_done(fixture: &WorkerFixture, session_id: &str) {
+        for _ in 0..20 {
+            if fixture.tracker.pending_count(session_id) == 0 {
+                assert_eq!(
+                    fixture.db.get_session(session_id).unwrap().unwrap().status,
+                    SessionStatus::Done
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("session did not reach done");
+    }
+}
