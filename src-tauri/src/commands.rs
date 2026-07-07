@@ -3,6 +3,7 @@ use tauri::Manager;
 
 use crate::bootstrap::MODELS_DIR;
 use crate::error::{AppError, IO_ERROR};
+use crate::settings::{Settings, SettingsPatch, SettingsStore};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +34,19 @@ pub fn get_system_info(app: tauri::AppHandle) -> Result<SystemInfo, AppError> {
         models_dir: models_dir.display().to_string(),
         data_dir: data_dir.display().to_string(),
     })
+}
+
+#[tauri::command]
+pub fn get_settings(settings_store: tauri::State<'_, SettingsStore>) -> Result<Settings, AppError> {
+    settings_store.load()
+}
+
+#[tauri::command]
+pub fn update_settings(
+    settings_store: tauri::State<'_, SettingsStore>,
+    patch: SettingsPatch,
+) -> Result<Settings, AppError> {
+    settings_store.update(patch)
 }
 
 #[cfg(test)]
