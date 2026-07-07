@@ -5,6 +5,7 @@ import {
   listAudioDevices,
   pauseRecording,
   resumeRecording,
+  runSoundCheck,
   startRecording,
   stopRecording,
 } from "../lib/api";
@@ -16,6 +17,8 @@ import type {
   RecordingLevelEvent,
   RecordingState,
   Session,
+  SoundCheckLevelEvent,
+  SoundCheckResult,
   Source,
   StartRecordingRequest,
 } from "../lib/types";
@@ -35,6 +38,9 @@ interface RecordingStore {
   state: RecordingState;
   levels: RecordingLevelEvent;
   dropCount: number;
+  soundCheckRunning: boolean;
+  soundCheckLevels: SoundCheckLevelEvent;
+  soundCheckResult: SoundCheckResult | null;
   setup: RecordingSetup;
   loading: boolean;
   starting: boolean;
@@ -50,9 +56,11 @@ interface RecordingStore {
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   stop: () => Promise<Session | null>;
+  runSoundCheck: () => Promise<void>;
   applyLevel: (event: RecordingLevelEvent) => void;
   applyElapsed: (event: RecordingElapsedEvent) => void;
   applyDrops: (event: RecordingDropsEvent) => void;
+  applySoundCheckLevel: (event: SoundCheckLevelEvent) => void;
 }
 
 const initialState: RecordingState = {
@@ -75,6 +83,9 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   state: initialState,
   levels: { mic: 0, system: 0 },
   dropCount: 0,
+  soundCheckRunning: false,
+  soundCheckLevels: { mic: 0, system: 0 },
+  soundCheckResult: null,
   setup: initialSetup,
   loading: false,
   starting: false,
@@ -196,6 +207,26 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
+  async runSoundCheck() {
+    const setup = get().setup;
+    set({
+      soundCheckRunning: true,
+      soundCheckLevels: { mic: 0, system: 0 },
+      soundCheckResult: null,
+      error: null,
+    });
+    try {
+      const result = await runSoundCheck({
+        source: setup.source,
+        micDevice: setup.source === "system" ? null : setup.micDevice,
+        loopbackDevice: setup.source === "mic" ? null : setup.loopbackDevice,
+      });
+      set({ soundCheckResult: result, soundCheckRunning: false });
+    } catch (error) {
+      set({ error: errorMessage(error), soundCheckRunning: false });
+    }
+  },
+
   applyLevel(event) {
     set({ levels: event });
   },
@@ -211,6 +242,10 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
 
   applyDrops(event) {
     set({ dropCount: event.dropCount });
+  },
+
+  applySoundCheckLevel(event) {
+    set({ soundCheckLevels: event });
   },
 }));
 

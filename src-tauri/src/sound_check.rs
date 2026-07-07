@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -17,6 +17,8 @@ pub const SOUND_CHECK_LEVEL_EVENT: &str = "soundcheck://level";
 const DEFAULT_DURATION_MS: u64 = 5_000;
 const LEVEL_INTERVAL_MS: u64 = 100;
 const SILENCE_PEAK_DB: f32 = -120.0;
+const TEST_TONE_HZ: f32 = 880.0;
+const TEST_TONE_AMPLITUDE: f32 = 0.2;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -104,7 +106,7 @@ impl SoundCheckManager {
         let duration_ms = request.duration_ms.unwrap_or(DEFAULT_DURATION_MS);
         let wav_path = sound_check_wav_path(data_dir);
         let mut writer = StreamingWavWriter::create(&wav_path)?;
-        let frame = vec![0.0; samples_per_level_tick()];
+        let frame = sound_check_test_tone_frame();
         let ticks = duration_ms.div_ceil(LEVEL_INTERVAL_MS).max(1);
         let levels = level_payload_for_source(request.source);
 
@@ -215,11 +217,32 @@ fn validate_device(
 }
 
 fn sound_check_wav_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(SOUNDCHECK_DIR).join("test.wav")
+    data_dir
+        .join(SOUNDCHECK_DIR)
+        .join(format!("test-{}.wav", timestamp_ms()))
+}
+
+fn timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn samples_per_level_tick() -> usize {
     (WAV_SAMPLE_RATE as u64 * LEVEL_INTERVAL_MS / 1_000) as usize
+}
+
+fn sound_check_test_tone_frame() -> Vec<f32> {
+    let sample_count = samples_per_level_tick();
+    let sample_rate = WAV_SAMPLE_RATE as f32;
+    (0..sample_count)
+        .map(|sample_index| {
+            let phase =
+                2.0 * std::f32::consts::PI * TEST_TONE_HZ * sample_index as f32 / sample_rate;
+            phase.sin() * TEST_TONE_AMPLITUDE
+        })
+        .collect()
 }
 
 fn level_payload_for_source(source: Source) -> SoundCheckLevelPayload {
@@ -272,9 +295,10 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn run_sound_check_writes_wav_and_returns_absolute_path() {
+    fn run_sound_check_writes_audible_wav_and_returns_absolute_path() {
         let manager = SoundCheckManager::new();
-        let data_dir = temp_data_dir("run_sound_check_writes_wav_and_returns_absolute_path");
+        let data_dir =
+            temp_data_dir("run_sound_check_writes_audible_wav_and_returns_absolute_path");
         let events = TestSoundCheckEventSink::default();
 
         let result = manager
@@ -290,6 +314,15 @@ mod tests {
         assert_eq!(result.duration_ms, 100);
         assert_eq!(result.peak_mic_db, SILENCE_PEAK_DB);
         assert_eq!(events.levels.lock().unwrap().len(), 1);
+        let mut reader = hound::WavReader::open(&result.wav_path).unwrap();
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            samples.iter().any(|sample| *sample != 0),
+            "sound check wav must contain audible samples for the playback gate"
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

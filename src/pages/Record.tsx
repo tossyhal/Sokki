@@ -1,8 +1,9 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { formatDuration } from "../lib/format";
 import { useRecordingStore } from "../stores/useRecordingStore";
-import type { AudioDevice, Language, Source } from "../lib/types";
+import type { AudioDevice, Language, SoundCheckResult, Source } from "../lib/types";
 
 type RecordingSource = Exclude<Source, "import">;
 
@@ -27,6 +28,9 @@ export default function Record() {
     state,
     levels,
     dropCount,
+    soundCheckRunning,
+    soundCheckLevels,
+    soundCheckResult,
     setup,
     loading,
     starting,
@@ -42,6 +46,7 @@ export default function Record() {
     pause,
     resume,
     stop,
+    runSoundCheck,
   } = useRecordingStore();
 
   useEffect(() => {
@@ -122,6 +127,14 @@ export default function Record() {
             </div>
           </div>
 
+          <SoundCheckPanel
+            running={soundCheckRunning}
+            levels={soundCheckLevels}
+            result={soundCheckResult}
+            disabled={loading || starting || state.active}
+            onRun={() => void runSoundCheck()}
+          />
+
           <div className="grid gap-5">
             {needsMic ? (
               <SelectRow
@@ -172,6 +185,98 @@ export default function Record() {
           </div>
         </section>
       )}
+    </section>
+  );
+}
+
+function SoundCheckPanel({
+  running,
+  levels,
+  result,
+  disabled,
+  onRun,
+}: {
+  running: boolean;
+  levels: { mic: number; system: number };
+  result: SoundCheckResult | null;
+  disabled: boolean;
+  onRun: () => void;
+}) {
+  const wavSrc = result ? convertFileSrc(result.wavPath) : null;
+  const [playbackStatus, setPlaybackStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    setPlaybackStatus(null);
+  }, [result?.wavPath]);
+
+  return (
+    <section className="grid gap-4 border-t border-line pt-5">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-title">音声テスト</h2>
+          <p className="mt-1 text-meta text-ink-2">録音前の入力レベル確認</p>
+        </div>
+        <button
+          type="button"
+          onClick={onRun}
+          disabled={disabled || running}
+          className="h-10 rounded-btn border border-line-strong px-3 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+        >
+          {running ? "テスト中" : "テスト実行"}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <LevelMeter label="マイク" value={levels.mic} />
+        <LevelMeter label="システム音声" value={levels.system} />
+      </div>
+
+      {result ? (
+        <div className="grid gap-3">
+          <div className="grid grid-cols-3 gap-3 text-meta text-ink-2">
+            <div>
+              <span className="text-ink">時間</span> {formatDuration(result.durationMs)}
+            </div>
+            <div>
+              <span className="text-ink">Mic</span> {Math.round(result.peakMicDb)}dB
+            </div>
+            <div>
+              <span className="text-ink">Sys</span> {Math.round(result.peakSystemDb)}dB
+            </div>
+          </div>
+          {result.warnings.length > 0 ? (
+            <div className="grid gap-1 rounded-card border border-warn bg-warn-soft px-3 py-2 text-meta text-ink">
+              {result.warnings.map((warning) => (
+                <div key={warning}>{warning}</div>
+              ))}
+            </div>
+          ) : null}
+          {wavSrc ? (
+            <div className="grid gap-2">
+              <audio
+                key={wavSrc}
+                controls
+                src={wavSrc}
+                className="h-10 w-full"
+                preload="metadata"
+                onLoadedMetadata={() => setPlaybackStatus("音声メタデータを読み込みました")}
+                onPlay={() => setPlaybackStatus("再生を開始しました")}
+                onError={(event) => {
+                  const error = event.currentTarget.error;
+                  const detail = error ? `code=${error.code}` : "unknown";
+                  setPlaybackStatus(`音声を読み込めません: ${detail}`);
+                }}
+              />
+              <div className="break-all text-meta text-ink-3">
+                {playbackStatus ? `${playbackStatus} / ` : null}
+                {result.wavPath}
+                <br />
+                {wavSrc}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }

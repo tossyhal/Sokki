@@ -22,7 +22,10 @@
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/recordings/**/*", "$APPDATA/soundcheck/**/*"]
+        "scope": [
+          "$APPDATA/recordings/**/*",
+          "$APPDATA/soundcheck/**/*"
+        ]
       },
       "csp": "default-src 'self'; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }

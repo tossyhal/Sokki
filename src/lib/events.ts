@@ -29,8 +29,8 @@ export async function initEventListeners() {
     await listen<RecordingDropsEvent>("recording://drops", (event) => {
       useRecordingStore.getState().applyDrops(event.payload);
     }),
-    await listen<SoundCheckLevelEvent>("soundcheck://level", () => {
-      // Store wiring is added with the sound check UI panel.
+    await listen<SoundCheckLevelEvent>("soundcheck://level", (event) => {
+      useRecordingStore.getState().applySoundCheckLevel(event.payload);
     }),
   );
 }
