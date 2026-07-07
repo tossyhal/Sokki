@@ -22,6 +22,7 @@ tauri-build = { version = "2", features = [] }
 cpal = "0.15"
 crossbeam-channel = "0.5"
 env_logger = "0.11"
+hound = "3.5"
 log = "0.4"
 rubato = { version = "0.15", default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
