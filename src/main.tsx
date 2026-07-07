@@ -8,9 +8,12 @@ import "@fontsource/noto-sans-jp/600.css";
 import "@fontsource/noto-sans-jp/700.css";
 import "./styles/index.css";
 import App from "./App";
+import { BrowserRouter } from "react-router-dom";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
   </React.StrictMode>,
 );

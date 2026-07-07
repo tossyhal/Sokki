@@ -1,11 +1,57 @@
+import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import Library from "./pages/Library";
+import Onboarding from "./pages/Onboarding";
+import Record from "./pages/Record";
+import SessionDetail from "./pages/SessionDetail";
+import Settings from "./pages/Settings";
+
+const navItems = [
+  { to: "/", label: "ライブラリ" },
+  { to: "/settings", label: "設定" },
+];
+
+function navClassName({ isActive }: { isActive: boolean }) {
+  return [
+    "rounded-btn px-3 py-2 text-body transition-colors",
+    isActive ? "bg-elevate text-ink" : "text-ink-2 hover:bg-surface hover:text-ink",
+  ].join(" ");
+}
+
 export default function App() {
   return (
-    <main className="grid min-h-screen place-items-center bg-bg p-8 text-ink">
-      <section className="w-full max-w-xl rounded-panel border border-line bg-surface p-8 shadow-card">
-        <p className="mb-2 text-micro font-semibold uppercase text-ink-2">Sokki</p>
-        <h1 className="mb-3 text-h1">ローカル録音・文字起こし</h1>
-        <p className="text-body text-ink-2">Windows 向け Tauri アプリのスキャフォールドです。</p>
-      </section>
-    </main>
+    <div className="flex min-h-screen bg-bg text-ink">
+      <aside className="flex w-sidebar shrink-0 flex-col border-r border-line bg-surface-2 px-4 py-5">
+        <div className="mb-8 px-2">
+          <p className="text-title">Sokki</p>
+          <p className="mt-1 text-meta text-ink-2">ローカル文字起こし</p>
+        </div>
+
+        <NavLink
+          to="/record"
+          className="mb-4 rounded-btn bg-accent px-3 py-2 text-center text-body font-semibold text-white shadow-accent hover:bg-accent-hover"
+        >
+          新規録音
+        </NavLink>
+
+        <nav className="grid gap-1">
+          {navItems.map((item) => (
+            <NavLink key={item.to} to={item.to} className={navClassName} end={item.to === "/"}>
+              {item.label}
+            </NavLink>
+          ))}
+        </nav>
+      </aside>
+
+      <main className="min-w-0 flex-1">
+        <Routes>
+          <Route path="/onboarding" element={<Onboarding />} />
+          <Route path="/" element={<Library />} />
+          <Route path="/record" element={<Record />} />
+          <Route path="/session/:id" element={<SessionDetail />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </main>
+    </div>
   );
 }
