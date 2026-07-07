@@ -1,5 +1,12 @@
 export type GpuMode = "auto" | "force_cpu" | "force_gpu";
 export type Language = "ja" | "en" | "auto";
+export type Source = "mic" | "system" | "mix" | "import";
+export type SessionStatus =
+  | "recording"
+  | "transcribing"
+  | "done"
+  | "error"
+  | "interrupted";
 
 export interface AppError {
   code: string;
@@ -38,4 +45,33 @@ export interface AudioDevice {
 export interface AudioDevices {
   inputs: AudioDevice[];
   outputs: AudioDevice[];
+}
+
+export interface Session {
+  id: string;
+  title: string;
+  createdAt: number;
+  durationMs: number;
+  audioPath: string | null;
+  source: Source;
+  language: Language;
+  model: string;
+  status: SessionStatus;
+  errorMessage: string | null;
+  dropCount: number;
+}
+
+export interface StartRecordingRequest {
+  source: Exclude<Source, "import">;
+  language: Language;
+  model: string;
+  micDevice?: string | null;
+  loopbackDevice?: string | null;
+}
+
+export interface RecordingState {
+  active: boolean;
+  sessionId: string | null;
+  paused: boolean;
+  elapsedMs: number;
 }
