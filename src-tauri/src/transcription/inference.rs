@@ -131,7 +131,11 @@ pub fn build_full_params(
     }
     if job.kind == JobKind::Batch {
         if let Some(recording_active) = recording_active {
-            params.set_abort_callback_safe(Some(move || recording_active.load(Ordering::SeqCst)));
+            let abort_callback: Box<dyn FnMut() -> bool> =
+                Box::new(move || recording_active.load(Ordering::SeqCst));
+            params.set_abort_callback_safe::<Option<Box<dyn FnMut() -> bool>>, Box<dyn FnMut() -> bool>>(
+                Some(abort_callback),
+            );
         }
     }
     params

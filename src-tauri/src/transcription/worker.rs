@@ -252,6 +252,10 @@ mod tests {
     use crate::transcription::jobs::JobKind;
     use std::sync::atomic::AtomicUsize;
 
+    type ProcessedMessage = (String, JobKind);
+    type ProcessedSender = Sender<ProcessedMessage>;
+    type ProcessedReceiver = Receiver<ProcessedMessage>;
+
     #[test]
     fn rt_jobs_are_processed_before_queued_batch_jobs() {
         let fixture = WorkerFixture::new();
@@ -420,8 +424,8 @@ mod tests {
     }
 
     struct RecordingProcessor {
-        processed_tx: Sender<(String, JobKind)>,
-        processed_rx: Receiver<(String, JobKind)>,
+        processed_tx: ProcessedSender,
+        processed_rx: ProcessedReceiver,
     }
 
     impl Default for RecordingProcessor {
@@ -435,13 +439,13 @@ mod tests {
     }
 
     impl RecordingProcessor {
-        fn recv_processed(&self) -> (String, JobKind) {
+        fn recv_processed(&self) -> ProcessedMessage {
             self.processed_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("job should be processed")
         }
 
-        fn try_recv_processed(&self, timeout: Duration) -> Option<(String, JobKind)> {
+        fn try_recv_processed(&self, timeout: Duration) -> Option<ProcessedMessage> {
             self.processed_rx.recv_timeout(timeout).ok()
         }
     }
@@ -462,7 +466,7 @@ mod tests {
     }
 
     struct AbortFirstBatchProcessor {
-        processed_tx: Sender<(String, JobKind)>,
+        processed_tx: ProcessedSender,
         attempt: AtomicUsize,
         recording_active: Arc<AtomicBool>,
     }
@@ -488,7 +492,7 @@ mod tests {
         }
     }
 
-    fn processed_channel() -> (Sender<(String, JobKind)>, Receiver<(String, JobKind)>) {
+    fn processed_channel() -> (ProcessedSender, ProcessedReceiver) {
         unbounded()
     }
 
