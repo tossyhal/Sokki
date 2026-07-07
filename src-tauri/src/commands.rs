@@ -1,0 +1,70 @@
+use serde::Serialize;
+use tauri::Manager;
+
+use crate::bootstrap::MODELS_DIR;
+use crate::error::{AppError, IO_ERROR};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub app_version: String,
+    pub compiled_gpu_support: bool,
+    pub requested_backend: String,
+    pub active_backend: String,
+    pub gpu_error_message: Option<String>,
+    pub models_dir: String,
+    pub data_dir: String,
+}
+
+#[tauri::command]
+pub fn get_system_info(app: tauri::AppHandle) -> Result<SystemInfo, AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    let models_dir = data_dir.join(MODELS_DIR);
+
+    Ok(SystemInfo {
+        app_version: app.package_info().version.to_string(),
+        compiled_gpu_support: cfg!(feature = "gpu-vulkan"),
+        requested_backend: "auto".to_string(),
+        active_backend: "none".to_string(),
+        gpu_error_message: None,
+        models_dir: models_dir.display().to_string(),
+        data_dir: data_dir.display().to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn system_info_serializes_with_camel_case_fields() {
+        let info = SystemInfo {
+            app_version: "0.0.0".to_string(),
+            compiled_gpu_support: false,
+            requested_backend: "auto".to_string(),
+            active_backend: "none".to_string(),
+            gpu_error_message: None,
+            models_dir: "C:/Users/example/AppData/Roaming/com.sokki.app/models".to_string(),
+            data_dir: "C:/Users/example/AppData/Roaming/com.sokki.app".to_string(),
+        };
+
+        let value = serde_json::to_value(info).expect("SystemInfo should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "appVersion": "0.0.0",
+                "compiledGpuSupport": false,
+                "requestedBackend": "auto",
+                "activeBackend": "none",
+                "gpuErrorMessage": null,
+                "modelsDir": "C:/Users/example/AppData/Roaming/com.sokki.app/models",
+                "dataDir": "C:/Users/example/AppData/Roaming/com.sokki.app",
+            })
+        );
+    }
+}

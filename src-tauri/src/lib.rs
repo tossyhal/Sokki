@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod commands;
 pub mod error;
 
 use tauri::Manager;
@@ -15,6 +16,7 @@ pub fn run() {
             log::info!("Sokki app data directory: {}", data_dir.display());
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![commands::get_system_info])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
