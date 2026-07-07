@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Safety Supply Chain"
+  short_description: "Safe agent work and dependency audit"
+  default_prompt: "Use $agent-safety-and-supply-chain to check safe agent behavior and dependency risk."

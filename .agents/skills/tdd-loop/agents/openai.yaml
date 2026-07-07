@@ -1,0 +1,4 @@
+interface:
+  display_name: "TDD Loop"
+  short_description: "Test-first implementation workflow"
+  default_prompt: "Use $tdd-loop to implement this change with a test-first workflow."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "E2E Real Device Check"
+  short_description: "Browser, Tauri, and device QA"
+  default_prompt: "Use $e2e-real-device-check to verify this user-facing change end to end."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Sync ADR"
+  short_description: "Keep docs and decisions aligned"
+  default_prompt: "Use $docs-sync-adr to keep implementation docs and ADRs aligned with this change."
