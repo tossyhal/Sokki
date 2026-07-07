@@ -32,12 +32,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::delete_session,
+            commands::get_session,
+            commands::get_sessions,
             commands::get_system_info,
             commands::get_settings,
             commands::get_recording_state,
             commands::list_audio_devices,
             commands::pause_recording,
             commands::resume_recording,
+            commands::rename_session,
             commands::run_sound_check,
             commands::start_recording,
             commands::stop_recording,

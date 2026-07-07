@@ -1,7 +1,223 @@
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { formatDuration } from "../lib/format";
+import type { Session, SessionStatus, Source } from "../lib/types";
+import { useSessionStore } from "../stores/useSessionStore";
+
 export default function Library() {
+  const navigate = useNavigate();
+  const { sessions, loading, savingId, deletingId, error, load, rename, delete: deleteSession } =
+    useSessionStore();
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
   return (
-    <section className="px-8 py-7">
-      <h1 className="text-h1">ライブラリ</h1>
+    <section className="grid gap-6 px-8 py-7">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h1 className="text-h1">ライブラリ</h1>
+          <p className="mt-1 text-meta text-ink-2">{sessions.length} 件</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void load()}
+          disabled={loading}
+          className="h-10 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+        >
+          更新
+        </button>
+      </div>
+
+      {error ? (
+        <div className="rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
+          {error}
+        </div>
+      ) : null}
+
+      {loading && sessions.length === 0 ? (
+        <div className="border-t border-line py-8 text-body text-ink-2">読み込み中</div>
+      ) : null}
+
+      {!loading && sessions.length === 0 ? (
+        <div className="border-t border-line py-14 text-center">
+          <p className="text-title text-ink">録音はまだありません</p>
+          <button
+            type="button"
+            onClick={() => navigate("/record")}
+            className="mt-4 h-10 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover"
+          >
+            新規録音
+          </button>
+        </div>
+      ) : null}
+
+      {sessions.length > 0 ? (
+        <div className="grid gap-3 border-t border-line pt-4">
+          {sessions.map((session) => (
+            <SessionCard
+              key={session.id}
+              session={session}
+              saving={savingId === session.id}
+              deleting={deletingId === session.id}
+              onOpen={() => navigate(`/session/${session.id}`)}
+              onRename={(title) => void rename(session.id, title)}
+              onDelete={() => {
+                if (window.confirm(`「${session.title}」を削除しますか？`)) {
+                  void deleteSession(session.id);
+                }
+              }}
+            />
+          ))}
+        </div>
+      ) : null}
     </section>
   );
+}
+
+function SessionCard({
+  session,
+  saving,
+  deleting,
+  onOpen,
+  onRename,
+  onDelete,
+}: {
+  session: Session;
+  saving: boolean;
+  deleting: boolean;
+  onOpen: () => void;
+  onRename: (title: string) => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(session.title);
+
+  useEffect(() => {
+    setDraftTitle(session.title);
+  }, [session.title]);
+
+  const commitRename = () => {
+    const title = draftTitle.trim();
+    if (title && title !== session.title) {
+      onRename(title);
+    }
+    setEditing(false);
+  };
+
+  return (
+    <article
+      className="grid gap-3 rounded-card border border-line bg-surface px-4 py-3 hover:bg-surface-2"
+      aria-busy={saving || deleting}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
+          <div className="flex min-w-0 items-center gap-2">
+            <StatusBadge status={session.status} />
+            {session.dropCount > 0 ? (
+              <span className="rounded-chip bg-warn-soft px-2 py-1 text-micro text-ink">
+                欠落 {session.dropCount}
+              </span>
+            ) : null}
+            {!session.audioPath ? (
+              <span className="rounded-chip bg-warn-soft px-2 py-1 text-micro text-ink">
+                音声なし
+              </span>
+            ) : null}
+          </div>
+          <p className="mt-2 truncate text-title text-ink">{session.title}</p>
+          <p className="mt-1 text-meta text-ink-2">
+            {formatDate(session.createdAt)} / {formatDuration(session.durationMs)} /{" "}
+            {sourceLabel(session.source)} / {session.language}
+          </p>
+        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setEditing((value) => !value)}
+            disabled={saving || deleting}
+            className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            名前
+          </button>
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={saving || deleting}
+            className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            削除
+          </button>
+        </div>
+      </div>
+
+      {editing ? (
+        <div className="flex gap-2 border-t border-line pt-3">
+          <input
+            value={draftTitle}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            className="h-10 min-w-0 flex-1 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none focus:border-ink-2"
+            autoFocus
+          />
+          <button
+            type="button"
+            onClick={commitRename}
+            disabled={saving || draftTitle.trim().length === 0}
+            className="h-10 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+          >
+            保存
+          </button>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function StatusBadge({ status }: { status: SessionStatus }) {
+  const tone =
+    status === "error"
+      ? "bg-accent-soft text-accent"
+      : status === "interrupted"
+        ? "bg-warn-soft text-ink"
+        : status === "transcribing"
+          ? "bg-accent-soft text-accent"
+          : "bg-elevate text-ink-2";
+
+  return (
+    <span className={`rounded-chip px-2 py-1 text-micro font-semibold ${tone}`}>
+      {statusLabel(status)}
+    </span>
+  );
+}
+
+function statusLabel(status: SessionStatus) {
+  const labels: Record<SessionStatus, string> = {
+    recording: "録音中",
+    transcribing: "文字起こし中",
+    done: "完了",
+    error: "エラー",
+    interrupted: "中断",
+  };
+  return labels[status];
+}
+
+function sourceLabel(source: Source) {
+  const labels: Record<Source, string> = {
+    mic: "マイク",
+    system: "システム音声",
+    mix: "ミックス",
+    import: "インポート",
+  };
+  return labels[source];
+}
+
+function formatDate(timestampMs: number) {
+  return new Intl.DateTimeFormat("ja-JP", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestampMs));
 }

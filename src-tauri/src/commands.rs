@@ -4,7 +4,7 @@ use tauri::Manager;
 use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::MODELS_DIR;
 use crate::db::{Db, Session};
-use crate::error::{AppError, IO_ERROR};
+use crate::error::{AppError, DB_ERROR, IO_ERROR};
 use crate::recording::{
     RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
 };
@@ -129,9 +129,67 @@ pub fn run_sound_check(
     )
 }
 
+#[tauri::command]
+pub fn get_sessions(db: tauri::State<'_, Db>) -> Result<Vec<Session>, AppError> {
+    db.list_sessions().map_err(db_error)
+}
+
+#[tauri::command]
+pub fn get_session(db: tauri::State<'_, Db>, id: String) -> Result<Session, AppError> {
+    get_session_impl(&db, &id)
+}
+
+#[tauri::command]
+pub fn rename_session(
+    db: tauri::State<'_, Db>,
+    id: String,
+    title: String,
+) -> Result<Session, AppError> {
+    let title = validate_session_title(&title)?;
+    let changed = db.rename_session(&id, title).map_err(db_error)?;
+    if !changed {
+        return Err(session_not_found(&id));
+    }
+    get_session_impl(&db, &id)
+}
+
+#[tauri::command]
+pub fn delete_session(db: tauri::State<'_, Db>, id: String) -> Result<(), AppError> {
+    let changed = db.delete_session(&id).map_err(db_error)?;
+    if changed {
+        Ok(())
+    } else {
+        Err(session_not_found(&id))
+    }
+}
+
+fn get_session_impl(db: &Db, id: &str) -> Result<Session, AppError> {
+    db.get_session(id)
+        .map_err(db_error)?
+        .ok_or_else(|| session_not_found(id))
+}
+
+fn session_not_found(id: &str) -> AppError {
+    AppError::new(DB_ERROR, format!("session not found: {id}"))
+}
+
+fn validate_session_title(title: &str) -> Result<&str, AppError> {
+    let title = title.trim();
+    if title.is_empty() {
+        Err(AppError::new(DB_ERROR, "session title must not be empty"))
+    } else {
+        Ok(title)
+    }
+}
+
+fn db_error(error: rusqlite::Error) -> AppError {
+    AppError::new(DB_ERROR, format!("database error: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Language, SessionStatus, Source};
     use serde_json::json;
 
     #[test]
@@ -160,5 +218,49 @@ mod tests {
                 "dataDir": "C:/Users/example/AppData/Roaming/com.sokki.app",
             })
         );
+    }
+
+    #[test]
+    fn get_session_impl_returns_db_error_when_missing() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+
+        let error = get_session_impl(&db, "missing").unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "session not found: missing");
+    }
+
+    #[test]
+    fn rename_session_rejects_empty_title_contract() {
+        let error = validate_session_title("  ").unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "session title must not be empty");
+    }
+
+    #[test]
+    fn session_serializes_for_library_cards() {
+        let session = Session {
+            id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            created_at: 1_000,
+            duration_ms: 12_000,
+            audio_path: Some(
+                "C:/Users/example/AppData/Roaming/com.sokki.app/recordings/a.wav".to_string(),
+            ),
+            source: Source::Mic,
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            status: SessionStatus::Interrupted,
+            error_message: Some("recording interrupted by app shutdown".to_string()),
+            drop_count: 3,
+        };
+
+        let value = serde_json::to_value(session).expect("Session should serialize");
+
+        assert_eq!(value["createdAt"], json!(1_000));
+        assert_eq!(value["durationMs"], json!(12_000));
+        assert_eq!(value["status"], json!("interrupted"));
+        assert_eq!(value["dropCount"], json!(3));
     }
 }

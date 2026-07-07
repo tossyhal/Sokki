@@ -49,3 +49,19 @@ export function getRecordingState(): Promise<RecordingState> {
 export function runSoundCheck(request: SoundCheckRequest): Promise<SoundCheckResult> {
   return invoke<SoundCheckResult>("run_sound_check", { request });
 }
+
+export function getSessions(): Promise<Session[]> {
+  return invoke<Session[]>("get_sessions");
+}
+
+export function getSession(id: string): Promise<Session> {
+  return invoke<Session>("get_session", { id });
+}
+
+export function renameSession(id: string, title: string): Promise<Session> {
+  return invoke<Session>("rename_session", { id, title });
+}
+
+export function deleteSession(id: string): Promise<void> {
+  return invoke<void>("delete_session", { id });
+}
