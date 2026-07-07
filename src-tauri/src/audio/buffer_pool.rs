@@ -40,6 +40,11 @@ impl BufferPool {
     fn available(&self) -> usize {
         self.free_rx.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn available_for_test(&self) -> usize {
+        self.available()
+    }
 }
 
 impl Default for BufferPool {
