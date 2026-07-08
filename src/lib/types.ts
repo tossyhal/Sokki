@@ -132,3 +132,9 @@ export interface ImportFileResult {
   errorCode: string | null;
   errorMessage: string | null;
 }
+
+export interface RetranscribeSessionRequest {
+  id: string;
+  language: Language;
+  model: string;
+}

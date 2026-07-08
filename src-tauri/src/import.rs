@@ -128,6 +128,16 @@ pub struct ImportPipeline<'a> {
     pub session_id_generator: &'a dyn Fn() -> String,
 }
 
+pub struct BatchTranscriptionInput<'a> {
+    pub session_id: &'a str,
+    pub samples: &'a [f32],
+    pub sample_rate: u32,
+    pub duration_ms: u64,
+    pub language: Language,
+    pub model: &'a str,
+    pub vad_threshold_db: i32,
+}
+
 impl<'a> ImportPipeline<'a> {
     pub fn import_files(&self, request: &ImportFilesRequest) -> Vec<ImportFileResult> {
         request
@@ -187,33 +197,60 @@ impl<'a> ImportPipeline<'a> {
         );
         self.db.insert_session(&session).map_err(db_error)?;
 
-        for chunk in chunks {
-            let canceled = self.tracker.enqueue(&session_id);
-            let job = TranscribeJob {
-                session_id: session_id.clone(),
-                kind: JobKind::Batch,
-                audio: chunk.audio,
-                chunk_start_ms: chunk.chunk_start_ms,
-                valid_start_ms: chunk.valid_start_ms,
-                valid_end_ms: chunk.valid_end_ms,
-                session_duration_ms: decoded.duration_ms,
+        enqueue_batch_transcription(
+            self.db,
+            self.tracker,
+            self.enqueuer,
+            BatchTranscriptionInput {
+                session_id: &session_id,
+                samples: &decoded.samples,
+                sample_rate: decoded.sample_rate,
+                duration_ms: decoded.duration_ms,
                 language: request.language,
-                model: request.model.clone(),
-                canceled,
-            };
-            if let Err(error) = self.enqueuer.enqueue_batch_job(job) {
-                let _ = self.db.update_session_status(
-                    &session_id,
-                    SessionStatus::Error,
-                    Some(&error.message),
-                );
-                let _ = self.tracker.finish(self.db, &session_id, false);
-                return Err(error);
-            }
-        }
+                model: &request.model,
+                vad_threshold_db: self.vad_threshold_db,
+            },
+        )?;
 
         Ok(session_id)
     }
+}
+
+pub fn enqueue_batch_transcription(
+    db: &Db,
+    tracker: &JobTracker,
+    enqueuer: &dyn BatchJobEnqueuer,
+    input: BatchTranscriptionInput<'_>,
+) -> Result<usize, AppError> {
+    let chunks = split_batch_audio_chunks(input.samples, input.sample_rate, input.vad_threshold_db);
+    let chunk_count = chunks.len();
+
+    for chunk in chunks {
+        let canceled = tracker.enqueue(input.session_id);
+        let job = TranscribeJob {
+            session_id: input.session_id.to_string(),
+            kind: JobKind::Batch,
+            audio: chunk.audio,
+            chunk_start_ms: chunk.chunk_start_ms,
+            valid_start_ms: chunk.valid_start_ms,
+            valid_end_ms: chunk.valid_end_ms,
+            session_duration_ms: input.duration_ms,
+            language: input.language,
+            model: input.model.to_string(),
+            canceled,
+        };
+        if let Err(error) = enqueuer.enqueue_batch_job(job) {
+            let _ = db.update_session_status(
+                input.session_id,
+                SessionStatus::Error,
+                Some(&error.message),
+            );
+            let _ = tracker.finish(db, input.session_id, false);
+            return Err(error);
+        }
+    }
+
+    Ok(chunk_count)
 }
 
 pub fn validate_import_file(

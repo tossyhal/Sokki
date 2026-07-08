@@ -261,6 +261,31 @@ impl Db {
         })
     }
 
+    pub fn update_session_transcription(
+        &self,
+        id: &str,
+        language: Language,
+        model: &str,
+        status: SessionStatus,
+        error_message: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                "UPDATE sessions
+                 SET language = ?1, model = ?2, status = ?3, error_message = ?4
+                 WHERE id = ?5",
+                params![
+                    language.as_db_str(),
+                    model,
+                    status.as_db_str(),
+                    error_message,
+                    id
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn update_session_duration(
         &self,
         id: &str,

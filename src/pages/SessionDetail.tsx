@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useNavigate, useParams } from "react-router-dom";
-import { getSegments } from "../lib/api";
+import { getSegments, retranscribeSession } from "../lib/api";
 import { formatDuration } from "../lib/format";
-import type { Segment, Session, SessionStatus, Source } from "../lib/types";
+import type { Language, Segment, Session, SessionStatus, Source } from "../lib/types";
 import { useSessionStore } from "../stores/useSessionStore";
 
 export default function SessionDetail() {
@@ -15,6 +15,11 @@ export default function SessionDetail() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [segmentError, setSegmentError] = useState<string | null>(null);
   const [currentMs, setCurrentMs] = useState(0);
+  const [showRetranscribe, setShowRetranscribe] = useState(false);
+  const [retranscribeLanguage, setRetranscribeLanguage] = useState<Language>("ja");
+  const [retranscribeModel, setRetranscribeModel] = useState("medium-q5_0");
+  const [retranscribing, setRetranscribing] = useState(false);
+  const [retranscribeError, setRetranscribeError] = useState<string | null>(null);
 
   useEffect(() => {
     if (id) {
@@ -23,6 +28,13 @@ export default function SessionDetail() {
   }, [id, loadOne]);
 
   const session = selected?.id === id ? selected : null;
+
+  useEffect(() => {
+    if (session) {
+      setRetranscribeLanguage(session.language);
+      setRetranscribeModel(session.model);
+    }
+  }, [session?.id, session?.language, session?.model]);
 
   useEffect(() => {
     let active = true;
@@ -91,16 +103,30 @@ export default function SessionDetail() {
           </button>
           <h1 className="truncate text-h1">{session?.title ?? "セッション詳細"}</h1>
         </div>
-        {session?.status === "transcribing" ? (
-          <button
-            type="button"
-            onClick={() => void cancel(session.id)}
-            disabled={cancelingId === session.id}
-            className="h-10 shrink-0 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
-          >
-            {cancelingId === session.id ? "停止中" : "文字起こし停止"}
-          </button>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-2">
+          {session && session.status !== "recording" && session.status !== "transcribing" ? (
+            <button
+              type="button"
+              onClick={() => {
+                setRetranscribeError(null);
+                setShowRetranscribe(true);
+              }}
+              className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate"
+            >
+              再文字起こし
+            </button>
+          ) : null}
+          {session?.status === "transcribing" ? (
+            <button
+              type="button"
+              onClick={() => void cancel(session.id)}
+              disabled={cancelingId === session.id}
+              className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+            >
+              {cancelingId === session.id ? "停止中" : "文字起こし停止"}
+            </button>
+          ) : null}
+        </div>
       </div>
 
       {error ? (
@@ -140,7 +166,114 @@ export default function SessionDetail() {
           />
         </>
       ) : null}
+
+      {session && showRetranscribe ? (
+        <RetranscribeModal
+          language={retranscribeLanguage}
+          model={retranscribeModel}
+          submitting={retranscribing}
+          error={retranscribeError}
+          onLanguageChange={setRetranscribeLanguage}
+          onModelChange={setRetranscribeModel}
+          onCancel={() => setShowRetranscribe(false)}
+          onConfirm={() => {
+            setRetranscribing(true);
+            setRetranscribeError(null);
+            void retranscribeSession({
+              id: session.id,
+              language: retranscribeLanguage,
+              model: retranscribeModel.trim(),
+            })
+              .then(async () => {
+                setSegments([]);
+                setShowRetranscribe(false);
+                await loadOne(session.id);
+              })
+              .catch((error) => setRetranscribeError(errorMessage(error)))
+              .finally(() => setRetranscribing(false));
+          }}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function RetranscribeModal({
+  language,
+  model,
+  submitting,
+  error,
+  onLanguageChange,
+  onModelChange,
+  onCancel,
+  onConfirm,
+}: {
+  language: Language;
+  model: string;
+  submitting: boolean;
+  error: string | null;
+  onLanguageChange: (language: Language) => void;
+  onModelChange: (model: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const canSubmit = model.trim().length > 0 && !submitting;
+
+  return (
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/25 px-4">
+      <section className="w-full max-w-md rounded-card border border-line bg-surface p-5 shadow-panel">
+        <h2 className="text-title text-ink">再文字起こし</h2>
+        <p className="mt-1 text-meta text-ink-2">既存の文字起こしを削除して再処理します。</p>
+
+        <div className="mt-5 grid gap-4">
+          <label className="grid gap-2 text-body text-ink">
+            言語
+            <select
+              value={language}
+              onChange={(event) => onLanguageChange(event.target.value as Language)}
+              className="h-10 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none focus:border-ink-2"
+            >
+              <option value="ja">日本語</option>
+              <option value="en">英語</option>
+              <option value="auto">自動</option>
+            </select>
+          </label>
+          <label className="grid gap-2 text-body text-ink">
+            モデル
+            <input
+              value={model}
+              onChange={(event) => onModelChange(event.target.value)}
+              className="h-10 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none focus:border-ink-2"
+            />
+          </label>
+        </div>
+
+        {error ? (
+          <div className="mt-4 rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
+            {error}
+          </div>
+        ) : null}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            キャンセル
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!canSubmit}
+            className="h-10 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+          >
+            {submitting ? "開始中" : "開始"}
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 

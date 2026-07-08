@@ -2,12 +2,14 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::Manager;
 
+use crate::audio::decode::decode_audio_file;
 use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
-use crate::db::{Db, Segment, Session};
+use crate::db::{Db, Language, Segment, Session, SessionStatus};
 use crate::error::{AppError, DB_ERROR, IO_ERROR};
 use crate::import::{
-    available_space_for_path, ImportFileResult, ImportFilesRequest, ImportPipeline,
+    available_space_for_path, enqueue_batch_transcription, BatchJobEnqueuer,
+    BatchTranscriptionInput, ImportFileResult, ImportFilesRequest, ImportPipeline,
     ImportSessionIdGenerator,
 };
 use crate::recording::{
@@ -21,6 +23,8 @@ use crate::transcription::context::{ActiveBackend, WhisperContextManager};
 use crate::transcription::jobs::JobTracker;
 use crate::transcription::worker::TranscribeWorkerState;
 
+const MAX_RETRANSCRIBE_DURATION_MS: u64 = 3 * 60 * 60 * 1_000;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemInfo {
@@ -31,6 +35,14 @@ pub struct SystemInfo {
     pub gpu_error_message: Option<String>,
     pub models_dir: String,
     pub data_dir: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetranscribeSessionRequest {
+    pub id: String,
+    pub language: Language,
+    pub model: String,
 }
 
 #[tauri::command]
@@ -184,6 +196,24 @@ pub fn import_files(
 }
 
 #[tauri::command]
+pub fn retranscribe_session(
+    db: tauri::State<'_, Db>,
+    settings_store: tauri::State<'_, SettingsStore>,
+    tracker: tauri::State<'_, Arc<JobTracker>>,
+    worker: tauri::State<'_, TranscribeWorkerState>,
+    request: RetranscribeSessionRequest,
+) -> Result<(), AppError> {
+    let settings = settings_store.load()?;
+    retranscribe_session_impl(
+        &db,
+        tracker.as_ref(),
+        &*worker,
+        settings.vad_threshold_db,
+        request,
+    )
+}
+
+#[tauri::command]
 pub fn get_sessions(db: tauri::State<'_, Db>) -> Result<Vec<Session>, AppError> {
     db.list_sessions().map_err(db_error)
 }
@@ -245,6 +275,68 @@ fn get_segments_impl(db: &Db, session_id: &str) -> Result<Vec<Segment>, AppError
     db.list_segments(session_id).map_err(db_error)
 }
 
+fn retranscribe_session_impl(
+    db: &Db,
+    tracker: &JobTracker,
+    enqueuer: &dyn BatchJobEnqueuer,
+    vad_threshold_db: i32,
+    request: RetranscribeSessionRequest,
+) -> Result<(), AppError> {
+    if tracker.pending_count(&request.id) > 0 {
+        return Err(AppError::new(
+            DB_ERROR,
+            format!("transcription is already pending: {}", request.id),
+        ));
+    }
+    let session = get_session_impl(db, &request.id)?;
+    let audio_path = session.audio_path.as_deref().ok_or_else(|| {
+        AppError::new(
+            DB_ERROR,
+            format!("session has no audio file: {}", request.id),
+        )
+    })?;
+    let decoded = decode_audio_file(audio_path)?;
+    if decoded.duration_ms > MAX_RETRANSCRIBE_DURATION_MS {
+        return Err(AppError::new(
+            crate::error::AUDIO_TOO_LONG,
+            "session audio is longer than 3 hours",
+        ));
+    }
+
+    db.delete_segments_for_session(&request.id)
+        .map_err(db_error)?;
+    db.update_session_transcription(
+        &request.id,
+        request.language,
+        &request.model,
+        SessionStatus::Transcribing,
+        None,
+    )
+    .map_err(db_error)?;
+
+    let chunk_count = enqueue_batch_transcription(
+        db,
+        tracker,
+        enqueuer,
+        BatchTranscriptionInput {
+            session_id: &request.id,
+            samples: &decoded.samples,
+            sample_rate: decoded.sample_rate,
+            duration_ms: decoded.duration_ms,
+            language: request.language,
+            model: &request.model,
+            vad_threshold_db,
+        },
+    )?;
+
+    if chunk_count == 0 {
+        db.update_session_status(&request.id, SessionStatus::Done, None)
+            .map_err(db_error)?;
+    }
+
+    Ok(())
+}
+
 fn cancel_transcription_impl(db: &Db, tracker: &JobTracker, id: &str) -> Result<Session, AppError> {
     let session = get_session_impl(db, id)?;
     if !tracker.cancel(id) {
@@ -277,7 +369,10 @@ fn db_error(error: rusqlite::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::db::{Language, SessionStatus, Source};
+    use crate::transcription::jobs::TranscribeJob;
     use serde_json::json;
+    use std::path::Path;
+    use std::sync::Mutex;
 
     #[test]
     fn system_info_serializes_with_camel_case_fields() {
@@ -408,6 +503,104 @@ mod tests {
     }
 
     #[test]
+    fn retranscribe_session_deletes_segments_updates_session_and_enqueues_jobs() {
+        let data_dir = temp_dir("retranscribe-success");
+        let wav_path = data_dir.join("source.wav");
+        write_mono_wav(&wav_path, 16_000, 31_000);
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        let enqueuer = RecordingEnqueuer::default();
+        let mut session = sample_session("session-a", SessionStatus::Done);
+        session.audio_path = Some(wav_path.display().to_string());
+        db.insert_session(&session).expect("session should insert");
+        db.insert_segment(&crate::db::NewSegment {
+            session_id: "session-a".to_string(),
+            start_ms: 0,
+            end_ms: 500,
+            text: "old".to_string(),
+            lang: Some("ja".to_string()),
+        })
+        .expect("segment should insert");
+
+        retranscribe_session_impl(
+            &db,
+            &tracker,
+            &enqueuer,
+            -40,
+            RetranscribeSessionRequest {
+                id: "session-a".to_string(),
+                language: Language::En,
+                model: "small".to_string(),
+            },
+        )
+        .expect("retranscription should enqueue");
+
+        assert!(db
+            .list_segments("session-a")
+            .expect("segments should list")
+            .is_empty());
+        let updated = db
+            .get_session("session-a")
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(updated.status, SessionStatus::Transcribing);
+        assert_eq!(updated.language, Language::En);
+        assert_eq!(updated.model, "small");
+        assert_eq!(tracker.pending_count("session-a"), 3);
+        assert_eq!(enqueuer.jobs.lock().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn retranscribe_session_rejects_missing_audio_path() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        let enqueuer = RecordingEnqueuer::default();
+        db.insert_session(&sample_session("session-a", SessionStatus::Done))
+            .expect("session should insert");
+
+        let error = retranscribe_session_impl(
+            &db,
+            &tracker,
+            &enqueuer,
+            -40,
+            RetranscribeSessionRequest {
+                id: "session-a".to_string(),
+                language: Language::Ja,
+                model: "medium-q5_0".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "session has no audio file: session-a");
+    }
+
+    #[test]
+    fn retranscribe_session_rejects_pending_session() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        let enqueuer = RecordingEnqueuer::default();
+        tracker.enqueue("session-a");
+
+        let error = retranscribe_session_impl(
+            &db,
+            &tracker,
+            &enqueuer,
+            -40,
+            RetranscribeSessionRequest {
+                id: "session-a".to_string(),
+                language: Language::Ja,
+                model: "medium-q5_0".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "transcription is already pending: session-a");
+    }
+
+    #[test]
     fn session_serializes_for_library_cards() {
         let session = Session {
             id: "session-a".to_string(),
@@ -447,5 +640,45 @@ mod tests {
             error_message: None,
             drop_count: 0,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingEnqueuer {
+        jobs: Mutex<Vec<TranscribeJob>>,
+    }
+
+    impl BatchJobEnqueuer for RecordingEnqueuer {
+        fn enqueue_batch_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("sokki-commands-{name}-{}", unix_time_ms()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_mono_wav(path: &Path, sample_rate: u32, duration_ms: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let sample_count = sample_rate as u64 * duration_ms as u64 / 1_000;
+        for _ in 0..sample_count {
+            writer.write_sample::<i16>(i16::MAX / 4).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn unix_time_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 }

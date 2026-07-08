@@ -76,6 +76,7 @@ pub fn run() {
             commands::pause_recording,
             commands::resume_recording,
             commands::rename_session,
+            commands::retranscribe_session,
             commands::run_sound_check,
             commands::start_recording,
             commands::stop_recording,

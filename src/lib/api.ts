@@ -4,6 +4,7 @@ import type {
   ImportFileResult,
   ImportFilesRequest,
   RecordingState,
+  RetranscribeSessionRequest,
   Segment,
   Session,
   Settings,
@@ -71,6 +72,10 @@ export function getSession(id: string): Promise<Session> {
 
 export function getSegments(sessionId: string): Promise<Segment[]> {
   return invoke<Segment[]>("get_segments", { sessionId });
+}
+
+export function retranscribeSession(request: RetranscribeSessionRequest): Promise<void> {
+  return invoke<void>("retranscribe_session", { request });
 }
 
 export function renameSession(id: string, title: string): Promise<Session> {
