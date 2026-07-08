@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,8 @@ pub struct ModelManifestEntry {
     pub sha256: Option<String>,
     pub verified: bool,
     pub origin: ModelOrigin,
+    #[serde(default)]
+    pub corrupted: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -464,8 +466,65 @@ fn download_model_inner(
         sha256: Some(actual_sha256),
         verified: expected.is_some(),
         origin: ModelOrigin::App,
+        corrupted: false,
     });
     save_manifest(models_dir, &manifest)
+}
+
+pub fn verify_model_with_client(
+    models_dir: &Path,
+    name: &str,
+    client: &dyn ModelDownloadClient,
+) -> Result<ModelInfo, AppError> {
+    fs::create_dir_all(models_dir).map_err(io_error)?;
+    let catalog = model_catalog()
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .ok_or_else(|| AppError::new(MODEL_NOT_FOUND, format!("unknown model: {name}")))?;
+    let model_path = models_dir.join(catalog.file_name);
+    if !model_path.is_file() {
+        return Err(AppError::new(
+            MODEL_NOT_FOUND,
+            format!("model file not found: {}", catalog.file_name),
+        ));
+    }
+
+    let expected = client.expected_metadata(catalog)?.ok_or_else(|| {
+        AppError::new(
+            VERIFY_FAILED,
+            "expected model metadata was not available from Hugging Face",
+        )
+    })?;
+    let actual_size = fs::metadata(&model_path).map_err(io_error)?.len();
+    let actual_sha256 = hash_file(&model_path)?;
+    let existing = load_manifest(models_dir)?;
+    let origin = existing
+        .get(name)
+        .map(|entry| entry.origin)
+        .unwrap_or(ModelOrigin::Manual);
+    let verified = expected.size_bytes == actual_size && sha_eq(&expected.sha256, &actual_sha256);
+    let entry = ModelManifestEntry {
+        name: catalog.name.to_string(),
+        file_name: catalog.file_name.to_string(),
+        size_bytes: expected.size_bytes,
+        sha256: Some(expected.sha256),
+        verified,
+        origin,
+        corrupted: !verified,
+    };
+
+    let mut manifest = existing;
+    manifest.upsert(entry);
+    save_manifest(models_dir, &manifest)?;
+
+    if !verified {
+        return Err(AppError::new(
+            VERIFY_FAILED,
+            "local model failed SHA-256 or size verification",
+        ));
+    }
+
+    model_info(models_dir, catalog, manifest.get(name))
 }
 
 pub fn delete_model(models_dir: &Path, name: &str) -> Result<ModelInfo, AppError> {
@@ -569,7 +628,7 @@ fn model_info(
     };
     let downloaded = file_size.is_some();
     let corrupted = match (manifest_entry, file_size) {
-        (Some(entry), Some(size)) => size != entry.size_bytes,
+        (Some(entry), Some(size)) => entry.corrupted || size != entry.size_bytes,
         _ => false,
     };
     let origin = manifest_entry
@@ -621,6 +680,20 @@ fn remove_if_exists(path: &Path) -> Result<(), AppError> {
     }
 }
 
+fn hash_file(path: &Path) -> Result<String, AppError> {
+    let mut file = File::open(path).map_err(io_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(hasher.finalize().as_slice()))
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -665,6 +738,7 @@ mod tests {
             sha256: Some("abc".to_string()),
             verified: true,
             origin: ModelOrigin::App,
+            corrupted: false,
         });
 
         save_manifest(&models_dir, &manifest).expect("manifest should save");
@@ -759,6 +833,7 @@ mod tests {
         assert_eq!(entry.size_bytes, 5);
         assert!(entry.verified);
         assert_eq!(entry.origin, ModelOrigin::App);
+        assert!(!entry.corrupted);
         assert_eq!(
             entry.sha256.as_deref(),
             Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
@@ -793,6 +868,7 @@ mod tests {
         assert_eq!(entry.size_bytes, 5);
         assert!(!entry.verified);
         assert_eq!(entry.origin, ModelOrigin::App);
+        assert!(!entry.corrupted);
         assert_eq!(
             entry.sha256.as_deref(),
             Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
@@ -917,6 +993,84 @@ mod tests {
         let _ = fs::remove_dir_all(models_dir);
     }
 
+    #[test]
+    fn verify_model_marks_manual_file_verified_and_usable() {
+        let models_dir = temp_dir("verify-manual-success");
+        fs::write(models_dir.join("ggml-tiny.bin"), b"hello").expect("model file should write");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            })),
+            body: Vec::new(),
+            stream_error: None,
+        };
+
+        let info = verify_model_with_client(&models_dir, "tiny", &client)
+            .expect("manual model should verify");
+        let manifest = load_manifest(&models_dir).expect("manifest should load");
+        let entry = manifest.get("tiny").expect("manifest entry should exist");
+
+        assert!(info.downloaded);
+        assert!(info.verified);
+        assert!(info.usable);
+        assert!(!info.corrupted);
+        assert_eq!(info.origin, Some(ModelOrigin::Manual));
+        assert!(entry.verified);
+        assert!(!entry.corrupted);
+        assert_eq!(entry.origin, ModelOrigin::Manual);
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn verify_model_marks_mismatch_corrupted_and_rejects() {
+        let models_dir = temp_dir("verify-mismatch");
+        fs::write(models_dir.join("ggml-tiny.bin"), b"hello").expect("model file should write");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            })),
+            body: Vec::new(),
+            stream_error: None,
+        };
+
+        let error = verify_model_with_client(&models_dir, "tiny", &client).unwrap_err();
+        let manifest = load_manifest(&models_dir).expect("manifest should load");
+        let entry = manifest.get("tiny").expect("manifest entry should exist");
+        let models = get_model_inventory(&models_dir).expect("inventory should load");
+        let info = find(&models, "tiny");
+
+        assert_eq!(error.code, VERIFY_FAILED);
+        assert!(!entry.verified);
+        assert!(entry.corrupted);
+        assert!(info.corrupted);
+        assert!(!info.usable);
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn verify_model_rejects_missing_file() {
+        let models_dir = temp_dir("verify-missing");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            })),
+            body: Vec::new(),
+            stream_error: None,
+        };
+
+        let error = verify_model_with_client(&models_dir, "tiny", &client).unwrap_err();
+
+        assert_eq!(error.code, MODEL_NOT_FOUND);
+        assert!(!models_dir.join(MANIFEST_FILE).exists());
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
     fn entry(
         name: &str,
         file_name: &str,
@@ -931,6 +1085,7 @@ mod tests {
             sha256: Some(format!("sha-{name}")),
             verified,
             origin,
+            corrupted: false,
         }
     }
 

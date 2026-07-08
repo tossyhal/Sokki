@@ -99,7 +99,8 @@ pub fn run() {
             commands::run_sound_check,
             commands::start_recording,
             commands::stop_recording,
-            commands::update_settings
+            commands::update_settings,
+            commands::verify_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -48,6 +48,10 @@ export function deleteModel(name: string): Promise<ModelInfo> {
   return invoke<ModelInfo>("delete_model", { name });
 }
 
+export function verifyModel(name: string): Promise<ModelInfo> {
+  return invoke<ModelInfo>("verify_model", { name });
+}
+
 export function startRecording(request: StartRecordingRequest): Promise<string> {
   return invoke<string>("start_recording", { request });
 }

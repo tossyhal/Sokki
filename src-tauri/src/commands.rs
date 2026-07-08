@@ -16,7 +16,8 @@ use crate::import::{
 };
 use crate::models::{
     delete_model as delete_model_file, download_model_with_client_and_cancel, get_model_inventory,
-    ModelDownloadManager, ModelInfo, ReqwestModelDownloadClient, TauriModelDownloadEventSink,
+    verify_model_with_client, ModelDownloadManager, ModelInfo, ReqwestModelDownloadClient,
+    TauriModelDownloadEventSink,
 };
 use crate::recording::{
     RecordingManager, RecordingStartDeps, RecordingStateSnapshot, StartRecordingRequest,
@@ -154,6 +155,20 @@ pub fn delete_model(app: tauri::AppHandle, name: String) -> Result<ModelInfo, Ap
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
     delete_model_file(&data_dir.join(MODELS_DIR), &name)
+}
+
+#[tauri::command]
+pub async fn verify_model(app: tauri::AppHandle, name: String) -> Result<ModelInfo, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+        let client = ReqwestModelDownloadClient::new()?;
+        verify_model_with_client(&data_dir.join(MODELS_DIR), &name, &client)
+    })
+    .await
+    .map_err(|err| AppError::new(IO_ERROR, format!("model verify task failed: {err}")))?
 }
 
 #[tauri::command]
