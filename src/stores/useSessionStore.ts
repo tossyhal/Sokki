@@ -6,11 +6,12 @@ import {
   getSessions,
   renameSession,
 } from "../lib/api";
-import type { Session } from "../lib/types";
+import type { Segment, Session } from "../lib/types";
 
 interface SessionStore {
   sessions: Session[];
   selected: Session | null;
+  liveSegmentsBySession: Record<string, Segment[]>;
   loading: boolean;
   savingId: string | null;
   deletingId: string | null;
@@ -19,6 +20,8 @@ interface SessionStore {
   load: () => Promise<void>;
   loadOne: (id: string) => Promise<Session | null>;
   applyStatus: (id: string, status: Session["status"], message?: string | null) => void;
+  applySegment: (segment: Segment) => void;
+  clearLiveSegments: (sessionId: string) => void;
   rename: (id: string, title: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
   delete: (id: string) => Promise<boolean>;
@@ -27,6 +30,7 @@ interface SessionStore {
 export const useSessionStore = create<SessionStore>((set, get) => ({
   sessions: [],
   selected: null,
+  liveSegmentsBySession: {},
   loading: false,
   savingId: null,
   deletingId: null,
@@ -67,6 +71,29 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     set({
       sessions: get().sessions.map(apply),
       selected: get().selected?.id === id ? apply(get().selected) : get().selected,
+    });
+  },
+
+  applySegment(segment) {
+    set((current) => {
+      const existing = current.liveSegmentsBySession[segment.sessionId] ?? [];
+      const next = mergeSegment(existing, segment);
+      return {
+        liveSegmentsBySession: {
+          ...current.liveSegmentsBySession,
+          [segment.sessionId]: next,
+        },
+      };
+    });
+  },
+
+  clearLiveSegments(sessionId) {
+    set((current) => {
+      if (!current.liveSegmentsBySession[sessionId]) {
+        return current;
+      }
+      const { [sessionId]: _removed, ...rest } = current.liveSegmentsBySession;
+      return { liveSegmentsBySession: rest };
     });
   },
 
@@ -119,6 +146,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
   },
 }));
+
+function mergeSegment(segments: Segment[], segment: Segment) {
+  const next = segments.filter((item) => item.id !== segment.id);
+  next.push(segment);
+  next.sort((a, b) => a.startMs - b.startMs || a.id - b.id);
+  return next;
+}
 
 function errorMessage(error: unknown) {
   if (error && typeof error === "object" && "message" in error) {

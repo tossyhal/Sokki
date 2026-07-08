@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useNavigate, useParams } from "react-router-dom";
@@ -9,6 +8,8 @@ import { exportSession, getSegments, retranscribeSession } from "../lib/api";
 import { formatDuration } from "../lib/format";
 import type { ExportFormat, Language, Segment, Session, SessionStatus, Source } from "../lib/types";
 import { useSessionStore } from "../stores/useSessionStore";
+
+const EMPTY_SEGMENTS: Segment[] = [];
 
 export default function SessionDetail() {
   const { id } = useParams();
@@ -19,7 +20,9 @@ export default function SessionDetail() {
     cancelingId,
     deletingId,
     error,
+    liveSegmentsBySession,
     loadOne,
+    clearLiveSegments,
     cancel,
     delete: deleteSession,
   } = useSessionStore();
@@ -35,6 +38,7 @@ export default function SessionDetail() {
   const [showExport, setShowExport] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [requestedSessionId, setRequestedSessionId] = useState<string | null>(null);
+  const liveSegments = id ? (liveSegmentsBySession[id] ?? EMPTY_SEGMENTS) : EMPTY_SEGMENTS;
 
   useEffect(() => {
     if (id) {
@@ -60,11 +64,14 @@ export default function SessionDetail() {
     if (!id) {
       return;
     }
+    clearLiveSegments(id);
 
     void getSegments(id)
       .then((items) => {
         if (active) {
-          setSegments(items);
+          setSegments((current) =>
+            current.reduce((merged, segment) => mergeSegment(merged, segment), items),
+          );
         }
       })
       .catch((error) => {
@@ -76,35 +83,16 @@ export default function SessionDetail() {
     return () => {
       active = false;
     };
-  }, [id]);
+  }, [id, clearLiveSegments]);
 
   useEffect(() => {
-    if (!id) {
+    if (liveSegments.length === 0) {
       return;
     }
-
-    let unlisten: (() => void) | null = null;
-    let disposed = false;
-
-    void listen<Segment>("transcript://segment", (event) => {
-      const segment = event.payload;
-      if (segment.sessionId !== id) {
-        return;
-      }
-      setSegments((current) => mergeSegment(current, segment));
-    }).then((handler) => {
-      if (disposed) {
-        handler();
-      } else {
-        unlisten = handler;
-      }
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [id]);
+    setSegments((current) =>
+      liveSegments.reduce((merged, segment) => mergeSegment(merged, segment), current),
+    );
+  }, [liveSegments]);
 
   return (
     <section className="grid gap-6 px-8 py-7">

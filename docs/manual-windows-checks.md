@@ -76,3 +76,4 @@ Prerequisite: a usable local Whisper model is available.
 - Confirm deleting from both the library card and session detail opens the in-app confirmation dialog and that canceling leaves the session intact.
 - Confirm the record setup view shows a clear warning when the selected source requires a missing input or output device.
 - Confirm the settings screen shows the CPU build note, disables GPU-using mode choices, and updates backend labels after changing GPU mode.
+- Confirm realtime transcript segments still appear once in the session detail view after navigating away and back.
