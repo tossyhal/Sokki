@@ -45,16 +45,15 @@
 - `feat: add onboarding flow with model download step`
   - `onboardingDone=false` 時の `/onboarding` 強制リダイレクトを追加。
   - ようこそ、モデル選択/DL、言語既定、完了の4ステップを実装。`medium-q5_0` を既定選択し、DL進捗/キャンセル/スキップに対応。
+- `fix: enforce usable models in backend start paths`
+  - `start_recording` / `import_files` / `retranscribe_session` の開始時に backend 側でも `get_model_inventory` ベースの usable 判定を実施。
+  - 未DLは `MODEL_NOT_FOUND`、破損は `MODEL_CORRUPTED`、手動配置未検証など usable=false は `MODEL_UNVERIFIED` として開始前に拒否。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
 ## 残タスク
 
-### 1. モデル usable 判定のバックエンド開始経路結線
-
-- `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§6.2.1 / §15 コミット26に記載)は未実装。現状は Record UI での抑止のみ。
-
-### 2. フロントエンド残ギャップ(spec §8 総点検)
+### 1. フロントエンド残ギャップ(spec §8 総点検)
 
 - §8 の画面仕様と現実装の突き合わせ。少なくとも以下を確認:
   - Record ページ: モデル選択が usable のみ活性になっているか(モデル管理実装後)。
@@ -62,13 +61,13 @@
   - サウンドチェック結果の再生ゲート(§9、`$APPDATA` scope)が実機で通るか。
 - 完了後、§13 受入チェックリストを `docs/acceptance.md` に記録(コミット62)。
 
-### 3. M6 残タスク(§15 コミット60〜62)
+### 2. M6 残タスク(§15 コミット60〜62)
 
 - コミット60: `pnpm tauri:build:win` による CPU版NSISクロスビルド成功確認。
 - コミット61: README に build/release instructions、手動テスト手順、既知の制限、依存バージョン変更履歴を同期。
 - コミット62: `docs/acceptance.md` に §13 の確認結果を記録し、必要ならタグ付け。
 
-### 4. コード品質クリーンアップ / 実機リスク
+### 3. コード品質クリーンアップ / 実機リスク
 
 - `/simplify` または `/code-review` を直近の変更(pipeline/recording/sound_check)にかける。
 - 既知の設計メモ:

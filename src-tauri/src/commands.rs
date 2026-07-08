@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::path::Path;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -7,7 +8,9 @@ use crate::audio::devices::{self, AudioDevices};
 use crate::audio::pipeline::SharedCaptureErrorHandler;
 use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
 use crate::db::{Db, Language, Segment, Session, SessionStatus};
-use crate::error::{AppError, DB_ERROR, IO_ERROR};
+use crate::error::{
+    AppError, DB_ERROR, IO_ERROR, MODEL_CORRUPTED, MODEL_NOT_FOUND, MODEL_UNVERIFIED,
+};
 use crate::export::{self, ExportFormat};
 use crate::import::{
     available_space_for_path, enqueue_batch_transcription, BatchJobEnqueuer,
@@ -185,6 +188,7 @@ pub fn start_recording(
         .path()
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    validate_usable_model(&data_dir.join(MODELS_DIR), &request.model)?;
     let settings = settings_store.load()?;
     let deps = RecordingStartDeps {
         tracker: Arc::clone(tracker.inner()),
@@ -348,6 +352,7 @@ fn import_files_blocking(
     let worker = app.state::<Arc<TranscribeWorkerState>>();
     let id_generator = app.state::<ImportSessionIdGenerator>();
     let settings = settings_store.load()?;
+    validate_usable_model(&data_dir.join(MODELS_DIR), &request.model)?;
     let available_space_bytes = match available_space_for_path(&recordings_dir) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -376,17 +381,54 @@ fn import_task_failed(error: impl std::fmt::Display) -> AppError {
     AppError::new(IO_ERROR, format!("import task failed: {error}"))
 }
 
+fn validate_usable_model(models_dir: &Path, name: &str) -> Result<(), AppError> {
+    let models = get_model_inventory(models_dir)?;
+    let model = models
+        .iter()
+        .find(|model| model.name == name)
+        .ok_or_else(|| {
+            AppError::new(MODEL_NOT_FOUND, format!("model is not in catalog: {name}"))
+        })?;
+
+    if !model.downloaded {
+        return Err(AppError::new(
+            MODEL_NOT_FOUND,
+            format!("model is not downloaded: {name}"),
+        ));
+    }
+    if model.corrupted {
+        return Err(AppError::new(
+            MODEL_CORRUPTED,
+            format!("model is corrupted: {name}"),
+        ));
+    }
+    if !model.usable {
+        return Err(AppError::new(
+            MODEL_UNVERIFIED,
+            format!("model is not verified: {name}"),
+        ));
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn retranscribe_session(
+    app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
     settings_store: tauri::State<'_, SettingsStore>,
     tracker: tauri::State<'_, Arc<JobTracker>>,
     worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
     request: RetranscribeSessionRequest,
 ) -> Result<(), AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
     let settings = settings_store.load()?;
     retranscribe_session_impl(
         &db,
+        &data_dir.join(MODELS_DIR),
         tracker.as_ref(),
         worker.inner().as_ref(),
         settings.vad_threshold_db,
@@ -466,6 +508,7 @@ fn get_segments_impl(db: &Db, session_id: &str) -> Result<Vec<Segment>, AppError
 
 fn retranscribe_session_impl(
     db: &Db,
+    models_dir: &Path,
     tracker: &JobTracker,
     enqueuer: &dyn BatchJobEnqueuer,
     vad_threshold_db: i32,
@@ -484,6 +527,7 @@ fn retranscribe_session_impl(
             format!("session has no audio file: {}", request.id),
         )
     })?;
+    validate_usable_model(models_dir, &request.model)?;
     let decoded = decode_audio_file(audio_path)?;
     if decoded.duration_ms > MAX_RETRANSCRIBE_DURATION_MS {
         return Err(AppError::new(
@@ -558,6 +602,7 @@ fn db_error(error: rusqlite::Error) -> AppError {
 mod tests {
     use super::*;
     use crate::db::{Language, SessionStatus, Source};
+    use crate::models::{save_manifest, ModelManifest, ModelManifestEntry, ModelOrigin};
     use crate::transcription::jobs::TranscribeJob;
     use serde_json::json;
     use std::path::Path;
@@ -700,8 +745,64 @@ mod tests {
     }
 
     #[test]
+    fn validate_usable_model_accepts_app_download_without_hf_verification() {
+        let models_dir = temp_dir("model-valid-app-unverified");
+        write_model_file(&models_dir, "ggml-medium-q5_0.bin", 12);
+        save_model_manifest(
+            &models_dir,
+            ModelManifestEntry {
+                name: "medium-q5_0".to_string(),
+                file_name: "ggml-medium-q5_0.bin".to_string(),
+                size_bytes: 12,
+                sha256: None,
+                verified: false,
+                origin: ModelOrigin::App,
+                corrupted: false,
+            },
+        );
+
+        validate_usable_model(&models_dir, "medium-q5_0").expect("app-downloaded model is usable");
+
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn validate_usable_model_rejects_missing_corrupted_and_unverified_manual_models() {
+        let models_dir = temp_dir("model-invalid");
+        write_model_file(&models_dir, "ggml-base.bin", 8);
+        write_model_file(&models_dir, "ggml-small.bin", 10);
+        let mut manifest = ModelManifest::default();
+        manifest.upsert(ModelManifestEntry {
+            name: "base".to_string(),
+            file_name: "ggml-base.bin".to_string(),
+            size_bytes: 10,
+            sha256: Some("abc".to_string()),
+            verified: true,
+            origin: ModelOrigin::App,
+            corrupted: false,
+        });
+        save_manifest(&models_dir, &manifest).expect("manifest should save");
+
+        let missing = validate_usable_model(&models_dir, "tiny").unwrap_err();
+        assert_eq!(missing.code, MODEL_NOT_FOUND);
+
+        let corrupted = validate_usable_model(&models_dir, "base").unwrap_err();
+        assert_eq!(corrupted.code, MODEL_CORRUPTED);
+
+        let manual = validate_usable_model(&models_dir, "small").unwrap_err();
+        assert_eq!(manual.code, MODEL_UNVERIFIED);
+
+        let unknown = validate_usable_model(&models_dir, "unknown").unwrap_err();
+        assert_eq!(unknown.code, MODEL_NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
     fn retranscribe_session_deletes_segments_updates_session_and_enqueues_jobs() {
         let data_dir = temp_dir("retranscribe-success");
+        let models_dir = temp_dir("retranscribe-success-models");
+        write_usable_app_model(&models_dir, "small", "ggml-small.bin", 12);
         let wav_path = data_dir.join("source.wav");
         write_mono_wav(&wav_path, 16_000, 31_000);
         let db = Db::open_in_memory().expect("in-memory db should migrate");
@@ -721,6 +822,7 @@ mod tests {
 
         retranscribe_session_impl(
             &db,
+            &models_dir,
             &tracker,
             &enqueuer,
             -40,
@@ -746,10 +848,12 @@ mod tests {
         assert_eq!(tracker.pending_count("session-a"), 3);
         assert_eq!(enqueuer.jobs.lock().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(data_dir);
+        let _ = std::fs::remove_dir_all(models_dir);
     }
 
     #[test]
     fn retranscribe_session_rejects_missing_audio_path() {
+        let models_dir = temp_dir("retranscribe-missing-audio-models");
         let db = Db::open_in_memory().expect("in-memory db should migrate");
         let tracker = JobTracker::new();
         let enqueuer = RecordingEnqueuer::default();
@@ -758,6 +862,7 @@ mod tests {
 
         let error = retranscribe_session_impl(
             &db,
+            &models_dir,
             &tracker,
             &enqueuer,
             -40,
@@ -771,10 +876,12 @@ mod tests {
 
         assert_eq!(error.code, DB_ERROR);
         assert_eq!(error.message, "session has no audio file: session-a");
+        let _ = std::fs::remove_dir_all(models_dir);
     }
 
     #[test]
     fn retranscribe_session_rejects_pending_session() {
+        let models_dir = temp_dir("retranscribe-pending-models");
         let db = Db::open_in_memory().expect("in-memory db should migrate");
         let tracker = JobTracker::new();
         let enqueuer = RecordingEnqueuer::default();
@@ -782,6 +889,7 @@ mod tests {
 
         let error = retranscribe_session_impl(
             &db,
+            &models_dir,
             &tracker,
             &enqueuer,
             -40,
@@ -795,6 +903,48 @@ mod tests {
 
         assert_eq!(error.code, DB_ERROR);
         assert_eq!(error.message, "transcription is already pending: session-a");
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn retranscribe_session_rejects_unusable_model_before_decode() {
+        let data_dir = temp_dir("retranscribe-unusable-model");
+        let models_dir = temp_dir("retranscribe-unusable-models");
+        write_model_file(&models_dir, "ggml-small.bin", 10);
+        let wav_path = data_dir.join("source.wav");
+        write_mono_wav(&wav_path, 16_000, 1_000);
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        let enqueuer = RecordingEnqueuer::default();
+        let mut session = sample_session("session-a", SessionStatus::Done);
+        session.audio_path = Some(wav_path.display().to_string());
+        db.insert_session(&session).expect("session should insert");
+
+        let error = retranscribe_session_impl(
+            &db,
+            &models_dir,
+            &tracker,
+            &enqueuer,
+            -40,
+            RetranscribeSessionRequest {
+                id: "session-a".to_string(),
+                language: Language::Ja,
+                model: "small".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, MODEL_UNVERIFIED);
+        assert_eq!(tracker.pending_count("session-a"), 0);
+        assert!(enqueuer.jobs.lock().unwrap().is_empty());
+        let unchanged = db
+            .get_session("session-a")
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(unchanged.status, SessionStatus::Done);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+        let _ = std::fs::remove_dir_all(models_dir);
     }
 
     #[test]
@@ -870,6 +1020,33 @@ mod tests {
             writer.write_sample::<i16>(i16::MAX / 4).unwrap();
         }
         writer.finalize().unwrap();
+    }
+
+    fn write_model_file(models_dir: &Path, file_name: &str, size: usize) {
+        std::fs::create_dir_all(models_dir).unwrap();
+        std::fs::write(models_dir.join(file_name), vec![0_u8; size]).unwrap();
+    }
+
+    fn save_model_manifest(models_dir: &Path, entry: ModelManifestEntry) {
+        let mut manifest = ModelManifest::default();
+        manifest.upsert(entry);
+        save_manifest(models_dir, &manifest).expect("manifest should save");
+    }
+
+    fn write_usable_app_model(models_dir: &Path, name: &str, file_name: &str, size: usize) {
+        write_model_file(models_dir, file_name, size);
+        save_model_manifest(
+            models_dir,
+            ModelManifestEntry {
+                name: name.to_string(),
+                file_name: file_name.to_string(),
+                size_bytes: size as u64,
+                sha256: None,
+                verified: false,
+                origin: ModelOrigin::App,
+                corrupted: false,
+            },
+        );
     }
 
     fn unix_time_ms() -> u64 {
