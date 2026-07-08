@@ -235,32 +235,49 @@ impl RecordingManager {
         Ok(())
     }
 
-    pub fn stop(&self, db: &Db) -> Result<Session, AppError> {
+    pub fn stop(
+        &self,
+        db: &Db,
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+    ) -> Result<Session, AppError> {
         let mut active = self
             .state
             .lock()
             .expect("recording state mutex should not be poisoned")
             .take()
             .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
-        self.active.store(false, Ordering::SeqCst);
 
-        let _ = active.event_stop_tx.send(());
-        if let Some(event_thread) = active.event_thread.take() {
-            let _ = event_thread.join();
+        let result = (|| {
+            let _ = active.event_stop_tx.send(());
+            if let Some(event_thread) = active.event_thread.take() {
+                let _ = event_thread.join();
+            }
+
+            if let Some(chunk) = active.segmenter.flush() {
+                enqueue_realtime_chunk(&active, chunk, tracker, enqueuer)?;
+            }
+
+            let duration_ms = active
+                .writer
+                .ok_or_else(|| AppError::new(IO_ERROR, "wav writer is already closed"))?
+                .finalize()? as i64;
+            let drop_count = active.drop_count.load(Ordering::Relaxed) as i64;
+            db.update_session_duration(&active.session_id, duration_ms, drop_count)
+                .map_err(db_error)?;
+
+            self.active.store(false, Ordering::SeqCst);
+            tracker.recording_stopped(db, &active.session_id)?;
+            db.get_session(&active.session_id)
+                .map_err(db_error)?
+                .ok_or_else(|| AppError::new(DB_ERROR, "recording session not found after stop"))
+        })();
+
+        if result.is_err() {
+            self.active.store(false, Ordering::SeqCst);
         }
 
-        let duration_ms = active
-            .writer
-            .ok_or_else(|| AppError::new(IO_ERROR, "wav writer is already closed"))?
-            .finalize()? as i64;
-        let drop_count = active.drop_count.load(Ordering::Relaxed) as i64;
-        db.update_session_duration(&active.session_id, duration_ms, drop_count)
-            .map_err(db_error)?;
-        db.update_session_status(&active.session_id, SessionStatus::Done, None)
-            .map_err(db_error)?;
-        db.get_session(&active.session_id)
-            .map_err(db_error)?
-            .ok_or_else(|| AppError::new(DB_ERROR, "recording session not found after stop"))
+        result
     }
 
     pub fn state(&self) -> Result<RecordingStateSnapshot, AppError> {
@@ -664,7 +681,7 @@ mod tests {
             )
             .unwrap();
 
-        let session = manager.stop(&db).unwrap();
+        let session = stop_without_pending(&manager, &db);
 
         assert_eq!(session.id, session_id);
         assert_eq!(session.status, SessionStatus::Done);
@@ -782,7 +799,7 @@ mod tests {
             .iter()
             .any(|level| level.mic == 0.25));
         assert!(!events.elapsed.lock().unwrap().is_empty());
-        manager.stop(&db).unwrap();
+        stop_without_pending(&manager, &db);
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 
@@ -831,7 +848,8 @@ mod tests {
         );
         drop(jobs);
 
-        let session = manager.stop(&db).unwrap();
+        let session = manager.stop(&db, &tracker, &enqueuer).unwrap();
+        assert_eq!(session.status, SessionStatus::Transcribing);
         assert!(session.duration_ms >= 1_900);
         std::fs::remove_dir_all(data_dir).unwrap();
     }
@@ -855,7 +873,7 @@ mod tests {
             .unwrap();
 
         assert!(active.load(Ordering::SeqCst));
-        manager.stop(&db).unwrap();
+        stop_without_pending(&manager, &db);
         assert!(!active.load(Ordering::SeqCst));
         std::fs::remove_dir_all(data_dir).unwrap();
     }
@@ -890,7 +908,83 @@ mod tests {
             db.get_session(&session_id).unwrap().unwrap().status,
             SessionStatus::Recording
         );
-        manager.stop(&db).unwrap();
+        stop_without_pending(&manager, &db);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stop_flushes_active_speech_and_returns_transcribing_when_pending() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir =
+            temp_data_dir("stop_flushes_active_speech_and_returns_transcribing_when_pending");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &enqueuer)
+            .unwrap();
+
+        let session = manager.stop(&db, &tracker, &enqueuer).unwrap();
+
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.status, SessionStatus::Transcribing);
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        let jobs = enqueuer.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].chunk_start_ms, 0);
+        assert_eq!(jobs[0].valid_start_ms, 300);
+        assert_eq!(jobs[0].valid_end_ms, 800);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stop_clears_active_flag_when_flush_enqueue_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("stop_clears_active_flag_when_flush_enqueue_fails");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(
+                &silence_ms(300),
+                &tracker,
+                &TestRealtimeJobEnqueuer::default(),
+            )
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &TestRealtimeJobEnqueuer::default())
+            .unwrap();
+
+        let error = manager
+            .stop(&db, &tracker, &FailingRealtimeJobEnqueuer)
+            .unwrap_err();
+
+        assert_eq!(error.message, "rt worker unavailable");
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 0);
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 
@@ -929,6 +1023,12 @@ mod tests {
 
     fn samples_for_ms(ms: u64) -> usize {
         (crate::audio::wav::WAV_SAMPLE_RATE as u64 * ms / 1_000) as usize
+    }
+
+    fn stop_without_pending(manager: &RecordingManager, db: &Db) -> Session {
+        manager
+            .stop(db, &JobTracker::new(), &TestRealtimeJobEnqueuer::default())
+            .unwrap()
     }
 
     fn temp_data_dir(name: &str) -> std::path::PathBuf {

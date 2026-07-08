@@ -18,6 +18,7 @@ interface SessionStore {
   error: string | null;
   load: () => Promise<void>;
   loadOne: (id: string) => Promise<Session | null>;
+  applyStatus: (id: string, status: Session["status"], message?: string | null) => void;
   rename: (id: string, title: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
   delete: (id: string) => Promise<void>;
@@ -52,6 +53,21 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       set({ error: errorMessage(error), loading: false, selected: null });
       return null;
     }
+  },
+
+  applyStatus(id, status, message) {
+    const apply = (session: Session) =>
+      session.id === id
+        ? {
+            ...session,
+            status,
+            errorMessage: status === "error" ? (message ?? session.errorMessage) : null,
+          }
+        : session;
+    set({
+      sessions: get().sessions.map(apply),
+      selected: get().selected?.id === id ? apply(get().selected) : get().selected,
+    });
   },
 
   async rename(id, title) {

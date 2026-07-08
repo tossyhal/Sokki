@@ -5,8 +5,27 @@ This file records checks that cannot be proven from WSL-only builds/tests. Run t
 ## Policy
 
 - WSL may be used for `pnpm build`, Rust formatting, `cargo xwin check`, `cargo xwin clippy`, and Windows-target test builds.
+- WSL may also be used for deterministic Rust/TypeScript logic checks such as JobTracker status transitions, stop flush behavior, worker event payloads, and frontend store updates.
+- Windows-target test builds from WSL prove compilation only; they do not prove the generated `.exe` behavior because the test binaries are not executed in WSL.
 - Do not treat WSL `tauri dev` or Linux Tauri builds as acceptance evidence.
 - Mark each item with the artifact/version tested, Windows version, and result before release.
+
+## WSL Substitute Checks
+
+These checks can be run from WSL before Windows handoff:
+
+- `pnpm build` for TypeScript/Vite production build.
+- `cd src-tauri && cargo fmt --all --check`.
+- `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc`.
+- `cd src-tauri && cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
+- `cd src-tauri && cargo xwin test --target x86_64-pc-windows-msvc --all-targets --no-run` to compile Windows-target tests.
+
+For stop/status changes, WSL tests should cover:
+
+- `stop_recording` flushes an active realtime segment and returns without waiting for worker completion.
+- The returned session is `transcribing` while pending realtime jobs remain and `done` when none remain.
+- JobTracker preserves `error` instead of overwriting it with `done`.
+- `session://status` updates list/detail UI state through the session store.
 
 ## Export Dialog
 
@@ -34,7 +53,9 @@ Prerequisite: a usable local Whisper model is available.
 - Confirm the segment around the 8-second boundary does not duplicate text from the 600ms overlap.
 - Start an import/batch transcription, then start recording while it is pending; confirm realtime recording is prioritized and the batch work resumes after recording stops.
 - Confirm the recorded WAV duration matches the recording length and the realtime transcript timestamps stay within the recorded duration.
-- Stop recording while realtime jobs are still pending and confirm the UI remains responsive without waiting for Whisper completion.
+- Stop recording while realtime jobs are still pending and confirm the UI immediately moves to the session detail view without waiting for Whisper completion.
+- Confirm the session status is `transcribing` until pending realtime jobs finish, then changes to `done` through `session://status`.
+- Force or simulate a transcription error and confirm the session remains `error` with a visible message instead of changing to `done`.
 
 ## Existing Desktop/Device Checks Still Required
 

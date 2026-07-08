@@ -9,11 +9,12 @@ use tauri::Emitter;
 
 use crate::db::{Db, NewSegment, Segment, SessionStatus};
 use crate::error::{AppError, DB_ERROR};
-use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+use crate::transcription::jobs::{JobCompletion, JobKind, JobTracker, TranscribeJob};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const IMPORT_PROGRESS_EVENT: &str = "import://progress";
 pub const TRANSCRIPT_SEGMENT_EVENT: &str = "transcript://segment";
+pub const SESSION_STATUS_EVENT: &str = "session://status";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,9 +23,18 @@ pub struct ImportProgressPayload {
     pub progress: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatusPayload {
+    pub session_id: String,
+    pub status: SessionStatus,
+    pub message: Option<String>,
+}
+
 pub trait TranscriptionEventSink: Send + Sync + 'static {
     fn emit_import_progress(&self, payload: ImportProgressPayload);
     fn emit_transcript_segment(&self, segment: Segment);
+    fn emit_session_status(&self, _payload: SessionStatusPayload) {}
 }
 
 pub struct NoopTranscriptionEventSink;
@@ -52,6 +62,10 @@ impl TranscriptionEventSink for TauriTranscriptionEventSink {
 
     fn emit_transcript_segment(&self, segment: Segment) {
         let _ = self.app.emit(TRANSCRIPT_SEGMENT_EVENT, segment);
+    }
+
+    fn emit_session_status(&self, payload: SessionStatusPayload) {
+        let _ = self.app.emit(SESSION_STATUS_EVENT, payload);
     }
 }
 
@@ -216,11 +230,7 @@ fn run_worker_loop(runtime: WorkerRuntime) {
 
         if let Some(job) = deferred.take() {
             if job.canceled() {
-                let _ = runtime.tracker.finish(
-                    &runtime.db,
-                    &job.session_id,
-                    runtime.recording_active.load(Ordering::SeqCst),
-                );
+                finish_job(&runtime, &job.session_id);
             } else {
                 process_or_finish(&runtime, job, &mut deferred);
             }
@@ -237,11 +247,7 @@ fn run_worker_loop(runtime: WorkerRuntime) {
             recv(runtime.batch_rx) -> job => {
                 if let Ok(job) = job {
                     if job.canceled() {
-                        let _ = runtime.tracker.finish(
-                            &runtime.db,
-                            &job.session_id,
-                            runtime.recording_active.load(Ordering::SeqCst),
-                        );
+                        finish_job(&runtime, &job.session_id);
                     } else {
                         process_or_finish(&runtime, job, &mut deferred);
                     }
@@ -265,11 +271,7 @@ fn process_or_finish(
     deferred: &mut Option<TranscribeJob>,
 ) {
     if job.canceled() {
-        let _ = runtime.tracker.finish(
-            &runtime.db,
-            &job.session_id,
-            runtime.recording_active.load(Ordering::SeqCst),
-        );
+        finish_job(runtime, &job.session_id);
         return;
     }
 
@@ -284,11 +286,7 @@ fn process_or_finish(
                     for segment in inserted_segments {
                         runtime.events.emit_transcript_segment(segment);
                     }
-                    let _ = runtime.tracker.finish(
-                        &runtime.db,
-                        &job.session_id,
-                        runtime.recording_active.load(Ordering::SeqCst),
-                    );
+                    finish_job(runtime, &job.session_id);
                     emit_import_progress(&runtime.events, &job);
                 }
                 Err(_) => {
@@ -297,11 +295,7 @@ fn process_or_finish(
                         SessionStatus::Error,
                         Some("failed to persist transcription segments"),
                     );
-                    let _ = runtime.tracker.finish(
-                        &runtime.db,
-                        &job.session_id,
-                        runtime.recording_active.load(Ordering::SeqCst),
-                    );
+                    finish_job(runtime, &job.session_id);
                 }
             }
         }
@@ -314,11 +308,27 @@ fn process_or_finish(
                 SessionStatus::Error,
                 Some(&error.message),
             );
-            let _ = runtime.tracker.finish(
-                &runtime.db,
-                &job.session_id,
-                runtime.recording_active.load(Ordering::SeqCst),
-            );
+            finish_job(runtime, &job.session_id);
+        }
+    }
+}
+
+fn finish_job(runtime: &WorkerRuntime, session_id: &str) {
+    let Ok(completion) = runtime.tracker.finish(
+        &runtime.db,
+        session_id,
+        runtime.recording_active.load(Ordering::SeqCst),
+    ) else {
+        return;
+    };
+
+    if let JobCompletion::Done { session_id } = completion {
+        if let Ok(Some(session)) = runtime.db.get_session(&session_id) {
+            runtime.events.emit_session_status(SessionStatusPayload {
+                session_id,
+                status: session.status,
+                message: session.error_message,
+            });
         }
     }
 }
@@ -594,6 +604,66 @@ mod tests {
         worker.shutdown();
     }
 
+    #[test]
+    fn completed_job_emits_done_status() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("session-a");
+        let processor = Arc::new(RecordingProcessor::default());
+        let events = Arc::new(RecordingEventSink::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+            events.clone(),
+        );
+
+        worker
+            .enqueue_rt(fixture.job("session-a", JobKind::Rt))
+            .unwrap();
+
+        eventually_done(&fixture, "session-a");
+        assert_eq!(
+            events.statuses.lock().unwrap().as_slice(),
+            &[SessionStatusPayload {
+                session_id: "session-a".to_string(),
+                status: SessionStatus::Done,
+                message: None,
+            }]
+        );
+        worker.shutdown();
+    }
+
+    #[test]
+    fn failed_job_emits_error_status() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("session-a");
+        let processor = Arc::new(FailingProcessor);
+        let events = Arc::new(RecordingEventSink::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+            events.clone(),
+        );
+
+        worker
+            .enqueue_rt(fixture.job("session-a", JobKind::Rt))
+            .unwrap();
+
+        eventually_done(&fixture, "session-a");
+        assert_eq!(
+            events.statuses.lock().unwrap().as_slice(),
+            &[SessionStatusPayload {
+                session_id: "session-a".to_string(),
+                status: SessionStatus::Error,
+                message: Some("transcribe failed".to_string()),
+            }]
+        );
+        worker.shutdown();
+    }
+
     struct RecordingProcessor {
         processed_tx: ProcessedSender,
         processed_rx: ProcessedReceiver,
@@ -656,6 +726,18 @@ mod tests {
         }
     }
 
+    struct FailingProcessor;
+
+    impl JobProcessor for FailingProcessor {
+        fn process(
+            &self,
+            _job: &TranscribeJob,
+            _should_abort: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<JobProcessResult, AppError> {
+            Err(AppError::new(DB_ERROR, "transcribe failed"))
+        }
+    }
+
     struct AbortFirstBatchProcessor {
         processed_tx: ProcessedSender,
         attempt: AtomicUsize,
@@ -691,6 +773,7 @@ mod tests {
     struct RecordingEventSink {
         payloads: Mutex<Vec<ImportProgressPayload>>,
         segments: Mutex<Vec<Segment>>,
+        statuses: Mutex<Vec<SessionStatusPayload>>,
     }
 
     impl TranscriptionEventSink for RecordingEventSink {
@@ -700,6 +783,10 @@ mod tests {
 
         fn emit_transcript_segment(&self, segment: Segment) {
             self.segments.lock().unwrap().push(segment);
+        }
+
+        fn emit_session_status(&self, payload: SessionStatusPayload) {
+            self.statuses.lock().unwrap().push(payload);
         }
     }
 

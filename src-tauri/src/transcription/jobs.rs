@@ -151,6 +151,43 @@ impl JobTracker {
             session_id: session_id.to_string(),
         })
     }
+
+    pub fn recording_stopped(&self, db: &Db, session_id: &str) -> Result<JobCompletion, AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("job tracker mutex should not be poisoned");
+
+        let pending = state.pending.get(session_id).copied().unwrap_or(0);
+        if pending > 0 {
+            let session = db
+                .get_session(session_id)
+                .map_err(db_error)?
+                .ok_or_else(|| {
+                    AppError::new(DB_ERROR, format!("session not found: {session_id}"))
+                })?;
+            if session.status != SessionStatus::Error {
+                db.update_session_status(session_id, SessionStatus::Transcribing, None)
+                    .map_err(db_error)?;
+            }
+            return Ok(JobCompletion::StillPending { pending });
+        }
+
+        let session = db
+            .get_session(session_id)
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::new(DB_ERROR, format!("session not found: {session_id}")))?;
+        if session.status != SessionStatus::Error {
+            db.update_session_status(session_id, SessionStatus::Done, None)
+                .map_err(db_error)?;
+        }
+        state.pending.remove(session_id);
+        state.cancel_flags.remove(session_id);
+
+        Ok(JobCompletion::Done {
+            session_id: session_id.to_string(),
+        })
+    }
 }
 
 fn db_error(error: rusqlite::Error) -> AppError {
@@ -233,6 +270,43 @@ mod tests {
 
         assert_eq!(
             tracker.finish(&db, "session-a", false).unwrap(),
+            JobCompletion::Done {
+                session_id: "session-a".to_string()
+            }
+        );
+        assert_eq!(
+            db.get_session("session-a").unwrap().unwrap().status,
+            SessionStatus::Done
+        );
+    }
+
+    #[test]
+    fn recording_stopped_marks_transcribing_when_jobs_remain() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        db.insert_session(&sample_session("session-a", SessionStatus::Recording))
+            .expect("session should insert");
+        let tracker = JobTracker::new();
+        tracker.enqueue("session-a");
+
+        assert_eq!(
+            tracker.recording_stopped(&db, "session-a").unwrap(),
+            JobCompletion::StillPending { pending: 1 }
+        );
+        assert_eq!(
+            db.get_session("session-a").unwrap().unwrap().status,
+            SessionStatus::Transcribing
+        );
+    }
+
+    #[test]
+    fn recording_stopped_marks_done_without_pending_jobs() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        db.insert_session(&sample_session("session-a", SessionStatus::Recording))
+            .expect("session should insert");
+        let tracker = JobTracker::new();
+
+        assert_eq!(
+            tracker.recording_stopped(&db, "session-a").unwrap(),
             JobCompletion::Done {
                 session_id: "session-a".to_string()
             }

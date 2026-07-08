@@ -119,6 +119,12 @@ export interface SoundCheckLevelEvent {
   system: number;
 }
 
+export interface SessionStatusEvent {
+  sessionId: string;
+  status: SessionStatus;
+  message?: string | null;
+}
+
 export interface ImportFilesRequest {
   paths: string[];
   language: Language;

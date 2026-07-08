@@ -134,8 +134,10 @@ pub fn resume_recording(
 pub fn stop_recording(
     db: tauri::State<'_, Db>,
     recording_manager: tauri::State<'_, RecordingManager>,
+    tracker: tauri::State<'_, Arc<JobTracker>>,
+    worker: tauri::State<'_, TranscribeWorkerState>,
 ) -> Result<Session, AppError> {
-    recording_manager.stop(&db)
+    recording_manager.stop(&db, &tracker, &*worker)
 }
 
 #[tauri::command]

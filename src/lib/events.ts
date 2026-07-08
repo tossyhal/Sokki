@@ -3,9 +3,11 @@ import type {
   RecordingDropsEvent,
   RecordingElapsedEvent,
   RecordingLevelEvent,
+  SessionStatusEvent,
   SoundCheckLevelEvent,
 } from "./types";
 import { useRecordingStore } from "../stores/useRecordingStore";
+import { useSessionStore } from "../stores/useSessionStore";
 
 let initialized = false;
 const unlisteners: UnlistenFn[] = [];
@@ -17,8 +19,10 @@ export async function initEventListeners() {
   initialized = true;
 
   unlisteners.push(
-    await listen("session://status", () => {
-      // Store wiring is added with the session store.
+    await listen<SessionStatusEvent>("session://status", (event) => {
+      useSessionStore
+        .getState()
+        .applyStatus(event.payload.sessionId, event.payload.status, event.payload.message);
     }),
     await listen<RecordingLevelEvent>("recording://level", (event) => {
       useRecordingStore.getState().applyLevel(event.payload);
