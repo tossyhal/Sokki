@@ -21,9 +21,9 @@
 
 ## 残タスク
 
-### 1. gpu_mode の陳腐化修正 + import の非同期化
+### 1. import の非同期化
 
-- **gpu_mode 陳腐化(確認済みの実バグ)**: `WhisperJobProcessor` は起動時の `initial_settings.gpu_mode` を保持し続ける(`lib.rs` setup、`transcription/inference.rs:35,72`)。設定画面で GPU モードを変更しても再起動まで反映されない。ジョブ実行時に `SettingsStore` から読む、または設定更新時にプロセッサへ通知する形に変更する。
+- **gpu_mode 陳腐化は修正済み**: `WhisperJobProcessor` はジョブ実行時に共有 `SettingsStore` から最新 `gpu_mode` を読む。
 - **import_files が同期コマンド**: `commands.rs` の `import_files` は同期実行のため、長時間ファイルのデコード中はメインスレッドがブロックされる。`run_sound_check` と同様に `spawn_blocking` 化する(進捗イベントは既存のまま)。
 
 ### 2. モデル管理バックエンド(§15 コミット12〜15)— 未着手

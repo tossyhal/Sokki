@@ -6,7 +6,7 @@ use whisper_rs::{FullParams, SamplingStrategy};
 
 use crate::db::{Db, Language, NewSegment, Segment};
 use crate::error::{AppError, DB_ERROR, WHISPER_ERROR};
-use crate::settings::GpuMode;
+use crate::settings::{GpuMode, SettingsStore};
 use crate::transcription::context::{model_path, WhisperContextManager};
 use crate::transcription::jobs::{JobKind, TranscribeJob};
 use crate::transcription::worker::{JobProcessResult, JobProcessor};
@@ -32,7 +32,7 @@ pub struct WhisperJobProcessor {
     db: Arc<Db>,
     context_manager: Arc<WhisperContextManager>,
     models_dir: PathBuf,
-    gpu_mode: GpuMode,
+    settings_store: SettingsStore,
     recording_active: Arc<AtomicBool>,
 }
 
@@ -41,16 +41,20 @@ impl WhisperJobProcessor {
         db: Arc<Db>,
         context_manager: Arc<WhisperContextManager>,
         models_dir: PathBuf,
-        gpu_mode: GpuMode,
+        settings_store: SettingsStore,
         recording_active: Arc<AtomicBool>,
     ) -> Self {
         Self {
             db,
             context_manager,
             models_dir,
-            gpu_mode,
+            settings_store,
             recording_active,
         }
+    }
+
+    fn current_gpu_mode(&self) -> Result<GpuMode, AppError> {
+        Ok(self.settings_store.read()?.gpu_mode)
     }
 }
 
@@ -69,7 +73,7 @@ impl JobProcessor for WhisperJobProcessor {
         self.context_manager.ensure_loaded(
             &job.model,
             &model_path(&self.models_dir, &job.model),
-            self.gpu_mode,
+            self.current_gpu_mode()?,
         )?;
 
         let result = self
@@ -364,7 +368,9 @@ fn whisper_error(message: impl Into<String>) -> AppError {
 mod tests {
     use super::*;
     use crate::db::NewSegment;
+    use crate::settings::{SettingsPatch, SettingsStore};
     use std::sync::atomic::AtomicBool;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn prompt_uses_tail_200_chars_without_splitting_multibyte_text() {
@@ -446,6 +452,35 @@ mod tests {
         let _rt_params = build_full_params(&rt_job, Some("直前テキスト"), None);
         let _batch_params =
             build_full_params(&batch_job, None, Some(Arc::new(AtomicBool::new(false))));
+    }
+
+    #[test]
+    fn processor_reads_latest_gpu_mode_from_settings_store() {
+        let settings_path = temp_path("processor_reads_latest_gpu_mode", "json");
+        let db_path = temp_path("processor_gpu_db", "sqlite");
+        let settings_store = SettingsStore::new(settings_path.clone());
+        settings_store.load().expect("default settings should load");
+        let processor = WhisperJobProcessor::new(
+            Arc::new(Db::open(&db_path).expect("db should open")),
+            Arc::new(WhisperContextManager::new()),
+            PathBuf::from("models"),
+            settings_store.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(processor.current_gpu_mode().unwrap(), GpuMode::Auto);
+
+        settings_store
+            .update(SettingsPatch {
+                gpu_mode: Some(GpuMode::ForceCpu),
+                ..SettingsPatch::default()
+            })
+            .expect("settings should update");
+
+        assert_eq!(processor.current_gpu_mode().unwrap(), GpuMode::ForceCpu);
+
+        let _ = std::fs::remove_file(settings_path);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
@@ -555,5 +590,13 @@ mod tests {
             model: "medium-q5_0".to_string(),
             canceled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn temp_path(name: &str, extension: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sokki-{name}-{nanos}.{extension}"))
     }
 }

@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
@@ -118,7 +118,12 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
+#[derive(Clone)]
 pub struct SettingsStore {
+    inner: Arc<SettingsStoreInner>,
+}
+
+struct SettingsStoreInner {
     path: PathBuf,
     lock: Mutex<()>,
 }
@@ -126,8 +131,10 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path,
-            lock: Mutex::new(()),
+            inner: Arc::new(SettingsStoreInner {
+                path,
+                lock: Mutex::new(()),
+            }),
         }
     }
 
@@ -137,6 +144,7 @@ impl SettingsStore {
 
     pub fn load(&self) -> Result<Settings, AppError> {
         let _guard = self
+            .inner
             .lock
             .lock()
             .expect("settings mutex should not be poisoned");
@@ -145,8 +153,18 @@ impl SettingsStore {
         Ok(settings)
     }
 
+    pub fn read(&self) -> Result<Settings, AppError> {
+        let _guard = self
+            .inner
+            .lock
+            .lock()
+            .expect("settings mutex should not be poisoned");
+        self.load_unlocked()
+    }
+
     pub fn update(&self, patch: SettingsPatch) -> Result<Settings, AppError> {
         let _guard = self
+            .inner
             .lock
             .lock()
             .expect("settings mutex should not be poisoned");
@@ -157,11 +175,11 @@ impl SettingsStore {
     }
 
     fn load_unlocked(&self) -> Result<Settings, AppError> {
-        if !self.path.exists() {
+        if !self.inner.path.exists() {
             return Ok(Settings::default());
         }
 
-        let content = fs::read_to_string(&self.path)
+        let content = fs::read_to_string(&self.inner.path)
             .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
         let patch: SettingsPatch = serde_json::from_str(&content)
             .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
@@ -171,12 +189,12 @@ impl SettingsStore {
     }
 
     fn save_unlocked(&self, settings: &Settings) -> Result<(), AppError> {
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = self.inner.path.parent() {
             fs::create_dir_all(parent).map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
         }
         let content = serde_json::to_string_pretty(settings)
             .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
-        fs::write(&self.path, format!("{content}\n"))
+        fs::write(&self.inner.path, format!("{content}\n"))
             .map_err(|err| AppError::new(IO_ERROR, err.to_string()))
     }
 }

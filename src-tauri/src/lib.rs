@@ -40,7 +40,7 @@ pub fn run() {
             }
             let worker_db = Arc::new(db::Db::open(&db_path)?);
             let settings_store = settings::SettingsStore::at_data_dir(&data_dir);
-            let initial_settings = settings_store.load()?;
+            settings_store.load()?;
             let whisper_context = Arc::new(transcription::context::WhisperContextManager::new());
             let tracker = Arc::new(transcription::jobs::JobTracker::new());
             let recording_manager = recording::RecordingManager::new();
@@ -49,7 +49,7 @@ pub fn run() {
                 Arc::clone(&worker_db),
                 Arc::clone(&whisper_context),
                 data_dir.join(bootstrap::MODELS_DIR),
-                initial_settings.gpu_mode,
+                settings_store.clone(),
                 Arc::clone(&transcription_active),
             ));
             let worker = transcription::worker::TranscribeWorkerHandle::start(
