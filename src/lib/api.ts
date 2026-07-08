@@ -56,6 +56,10 @@ export function importFiles(request: ImportFilesRequest): Promise<ImportFileResu
   return invoke<ImportFileResult[]>("import_files", { request });
 }
 
+export function cancelTranscription(id: string): Promise<Session> {
+  return invoke<Session>("cancel_transcription", { id });
+}
+
 export function getSessions(): Promise<Session[]> {
   return invoke<Session[]>("get_sessions");
 }

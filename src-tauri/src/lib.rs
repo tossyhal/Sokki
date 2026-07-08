@@ -63,6 +63,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::cancel_transcription,
             commands::delete_session,
             commands::get_session,
             commands::get_sessions,

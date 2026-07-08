@@ -1,5 +1,11 @@
 import { create } from "zustand";
-import { deleteSession, getSession, getSessions, renameSession } from "../lib/api";
+import {
+  cancelTranscription,
+  deleteSession,
+  getSession,
+  getSessions,
+  renameSession,
+} from "../lib/api";
 import type { Session } from "../lib/types";
 
 interface SessionStore {
@@ -8,10 +14,12 @@ interface SessionStore {
   loading: boolean;
   savingId: string | null;
   deletingId: string | null;
+  cancelingId: string | null;
   error: string | null;
   load: () => Promise<void>;
   loadOne: (id: string) => Promise<Session | null>;
   rename: (id: string, title: string) => Promise<void>;
+  cancel: (id: string) => Promise<void>;
   delete: (id: string) => Promise<void>;
 }
 
@@ -21,6 +29,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   loading: false,
   savingId: null,
   deletingId: null,
+  cancelingId: null,
   error: null,
 
   async load() {
@@ -57,6 +66,20 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       });
     } catch (error) {
       set({ sessions: previous, error: errorMessage(error), savingId: null });
+    }
+  },
+
+  async cancel(id) {
+    set({ cancelingId: id, error: null });
+    try {
+      const session = await cancelTranscription(id);
+      set({
+        sessions: get().sessions.map((item) => (item.id === id ? session : item)),
+        selected: get().selected?.id === id ? session : get().selected,
+        cancelingId: null,
+      });
+    } catch (error) {
+      set({ error: errorMessage(error), cancelingId: null });
     }
   },
 

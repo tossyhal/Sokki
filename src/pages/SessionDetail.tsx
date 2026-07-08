@@ -8,7 +8,7 @@ import { useSessionStore } from "../stores/useSessionStore";
 export default function SessionDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { selected, loading, error, loadOne } = useSessionStore();
+  const { selected, loading, cancelingId, error, loadOne, cancel } = useSessionStore();
 
   useEffect(() => {
     if (id) {
@@ -31,6 +31,16 @@ export default function SessionDetail() {
           </button>
           <h1 className="truncate text-h1">{session?.title ?? "セッション詳細"}</h1>
         </div>
+        {session?.status === "transcribing" ? (
+          <button
+            type="button"
+            onClick={() => void cancel(session.id)}
+            disabled={cancelingId === session.id}
+            className="h-10 shrink-0 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            {cancelingId === session.id ? "停止中" : "文字起こし停止"}
+          </button>
+        ) : null}
       </div>
 
       {error ? (

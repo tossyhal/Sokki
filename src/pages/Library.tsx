@@ -6,8 +6,18 @@ import { useSessionStore } from "../stores/useSessionStore";
 
 export default function Library() {
   const navigate = useNavigate();
-  const { sessions, loading, savingId, deletingId, error, load, rename, delete: deleteSession } =
-    useSessionStore();
+  const {
+    sessions,
+    loading,
+    savingId,
+    deletingId,
+    cancelingId,
+    error,
+    load,
+    rename,
+    cancel,
+    delete: deleteSession,
+  } = useSessionStore();
 
   useEffect(() => {
     void load();
@@ -61,8 +71,10 @@ export default function Library() {
               session={session}
               saving={savingId === session.id}
               deleting={deletingId === session.id}
+              canceling={cancelingId === session.id}
               onOpen={() => navigate(`/session/${session.id}`)}
               onRename={(title) => void rename(session.id, title)}
+              onCancel={() => void cancel(session.id)}
               onDelete={() => {
                 if (window.confirm(`「${session.title}」を削除しますか？`)) {
                   void deleteSession(session.id);
@@ -80,15 +92,19 @@ function SessionCard({
   session,
   saving,
   deleting,
+  canceling,
   onOpen,
   onRename,
+  onCancel,
   onDelete,
 }: {
   session: Session;
   saving: boolean;
   deleting: boolean;
+  canceling: boolean;
   onOpen: () => void;
   onRename: (title: string) => void;
+  onCancel: () => void;
   onDelete: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -109,7 +125,7 @@ function SessionCard({
   return (
     <article
       className="grid gap-3 rounded-card border border-line bg-surface px-4 py-3 hover:bg-surface-2"
-      aria-busy={saving || deleting}
+      aria-busy={saving || deleting || canceling}
     >
       <div className="flex items-start justify-between gap-4">
         <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left">
@@ -133,10 +149,20 @@ function SessionCard({
           </p>
         </button>
         <div className="flex shrink-0 items-center gap-2">
+          {session.status === "transcribing" ? (
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={saving || deleting || canceling}
+              className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+            >
+              {canceling ? "停止中" : "停止"}
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => setEditing((value) => !value)}
-            disabled={saving || deleting}
+            disabled={saving || deleting || canceling}
             className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
           >
             名前
@@ -144,7 +170,7 @@ function SessionCard({
           <button
             type="button"
             onClick={onDelete}
-            disabled={saving || deleting}
+            disabled={saving || deleting || canceling}
             className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
           >
             削除

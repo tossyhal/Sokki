@@ -217,10 +217,30 @@ pub fn delete_session(db: tauri::State<'_, Db>, id: String) -> Result<(), AppErr
     }
 }
 
+#[tauri::command]
+pub fn cancel_transcription(
+    db: tauri::State<'_, Db>,
+    tracker: tauri::State<'_, Arc<JobTracker>>,
+    id: String,
+) -> Result<Session, AppError> {
+    cancel_transcription_impl(&db, tracker.as_ref(), &id)
+}
+
 fn get_session_impl(db: &Db, id: &str) -> Result<Session, AppError> {
     db.get_session(id)
         .map_err(db_error)?
         .ok_or_else(|| session_not_found(id))
+}
+
+fn cancel_transcription_impl(db: &Db, tracker: &JobTracker, id: &str) -> Result<Session, AppError> {
+    let session = get_session_impl(db, id)?;
+    if !tracker.cancel(id) {
+        return Err(AppError::new(
+            DB_ERROR,
+            format!("transcription is not pending: {id}"),
+        ));
+    }
+    Ok(session)
 }
 
 fn session_not_found(id: &str) -> AppError {
@@ -293,6 +313,46 @@ mod tests {
     }
 
     #[test]
+    fn cancel_transcription_sets_pending_cancel_flag() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        let flag = tracker.enqueue("session-a");
+        db.insert_session(&sample_session("session-a", SessionStatus::Transcribing))
+            .expect("session should insert");
+
+        let session = cancel_transcription_impl(&db, &tracker, "session-a")
+            .expect("pending session should cancel");
+
+        assert_eq!(session.id, "session-a");
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(tracker.pending_count("session-a"), 1);
+    }
+
+    #[test]
+    fn cancel_transcription_rejects_missing_session() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+
+        let error = cancel_transcription_impl(&db, &tracker, "missing").unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "session not found: missing");
+    }
+
+    #[test]
+    fn cancel_transcription_rejects_session_without_pending_job() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        let tracker = JobTracker::new();
+        db.insert_session(&sample_session("session-a", SessionStatus::Done))
+            .expect("session should insert");
+
+        let error = cancel_transcription_impl(&db, &tracker, "session-a").unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "transcription is not pending: session-a");
+    }
+
+    #[test]
     fn session_serializes_for_library_cards() {
         let session = Session {
             id: "session-a".to_string(),
@@ -316,5 +376,21 @@ mod tests {
         assert_eq!(value["durationMs"], json!(12_000));
         assert_eq!(value["status"], json!("interrupted"));
         assert_eq!(value["dropCount"], json!(3));
+    }
+
+    fn sample_session(id: &str, status: SessionStatus) -> Session {
+        Session {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: 1_000,
+            duration_ms: 12_000,
+            audio_path: None,
+            source: Source::Import,
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            status,
+            error_message: None,
+            drop_count: 0,
+        }
     }
 }
