@@ -684,6 +684,9 @@ Claude Design 製のHTMLモック(`Sokki.html`)を**見た目の参照**とし�
 
 ## 13. 受け入れ基準(最終チェックリスト)
 
+WSLで代替できないWindows実機・WebView・音声・installer・native dialog確認は、実装時点で
+[`docs/manual-windows-checks.md`](manual-windows-checks.md) に追記し、リリース前にWindows 10/11 x64上で確認する。
+
 **録音・音声**
 - [ ] マイクのみ / システム音声のみ / 両方 の3構成で録音・再生できる
 - [ ] システム音声のみ録音で、YouTube/Zoom/Teams/ブラウザ音声のいずれかを5秒テスト録音できる

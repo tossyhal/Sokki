@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useNavigate, useParams } from "react-router-dom";
-import { getSegments, retranscribeSession } from "../lib/api";
+import { exportSession, getSegments, retranscribeSession } from "../lib/api";
 import { formatDuration } from "../lib/format";
-import type { Language, Segment, Session, SessionStatus, Source } from "../lib/types";
+import type { ExportFormat, Language, Segment, Session, SessionStatus, Source } from "../lib/types";
 import { useSessionStore } from "../stores/useSessionStore";
 
 export default function SessionDetail() {
@@ -20,6 +22,7 @@ export default function SessionDetail() {
   const [retranscribeModel, setRetranscribeModel] = useState("medium-q5_0");
   const [retranscribing, setRetranscribing] = useState(false);
   const [retranscribeError, setRetranscribeError] = useState<string | null>(null);
+  const [showExport, setShowExport] = useState(false);
 
   useEffect(() => {
     if (id) {
@@ -104,6 +107,16 @@ export default function SessionDetail() {
           <h1 className="truncate text-h1">{session?.title ?? "セッション詳細"}</h1>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {session ? (
+            <button
+              type="button"
+              onClick={() => setShowExport(true)}
+              disabled={segments.length === 0}
+              className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+            >
+              エクスポート
+            </button>
+          ) : null}
           {session && session.status !== "recording" && session.status !== "transcribing" ? (
             <button
               type="button"
@@ -194,7 +207,140 @@ export default function SessionDetail() {
           }}
         />
       ) : null}
+
+      {session && showExport ? (
+        <ExportModal
+          session={session}
+          onCancel={() => setShowExport(false)}
+          onDone={() => setShowExport(false)}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function ExportModal({
+  session,
+  onCancel,
+  onDone,
+}: {
+  session: Session;
+  onCancel: () => void;
+  onDone: () => void;
+}) {
+  const [format, setFormat] = useState<ExportFormat>("txt");
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const extension = formatExtension(format);
+
+  const runExport = async () => {
+    setExporting(true);
+    setError(null);
+    setExportedPath(null);
+    try {
+      const path = await save({
+        title: "文字起こしをエクスポート",
+        defaultPath: `${safeFileBase(session.title)}.${extension}`,
+        filters: [{ name: formatLabel(format), extensions: [extension] }],
+      });
+      if (!path) {
+        setExporting(false);
+        return;
+      }
+      await exportSession({ sessionId: session.id, format, path });
+      setExportedPath(path);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const revealExport = async () => {
+    if (!exportedPath) {
+      return;
+    }
+    try {
+      await revealItemInDir(exportedPath);
+    } catch (error) {
+      setError(errorMessage(error));
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/25 px-4">
+      <section className="w-full max-w-md rounded-card border border-line bg-surface p-5 shadow-panel">
+        <h2 className="text-title text-ink">エクスポート</h2>
+        <p className="mt-1 text-meta text-ink-2">文字起こしをファイルに保存します。</p>
+
+        <div className="mt-5 grid grid-cols-3 gap-2">
+          {(["txt", "srt", "md"] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => {
+                setFormat(value);
+                setError(null);
+                setExportedPath(null);
+              }}
+              disabled={exporting}
+              className={`h-10 rounded-btn border px-3 text-body font-semibold ${
+                format === value
+                  ? "border-ink-2 bg-elevate text-ink"
+                  : "border-line-strong text-ink hover:bg-elevate"
+              } disabled:text-ink-3`}
+            >
+              {value.toUpperCase()}
+            </button>
+          ))}
+        </div>
+
+        {exportedPath ? (
+          <div className="mt-4 rounded-card border border-line bg-elevate px-4 py-3 text-body text-ink">
+            <p>保存しました</p>
+            <p className="mt-1 break-all text-meta text-ink-2">{exportedPath}</p>
+          </div>
+        ) : null}
+
+        {error ? (
+          <div className="mt-4 rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
+            {error}
+          </div>
+        ) : null}
+
+        <div className="mt-5 flex justify-end gap-2">
+          {exportedPath ? (
+            <button
+              type="button"
+              onClick={() => void revealExport()}
+              disabled={exporting}
+              className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+            >
+              保存先を開く
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={exportedPath ? onDone : onCancel}
+            disabled={exporting}
+            className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            {exportedPath ? "閉じる" : "キャンセル"}
+          </button>
+          {!exportedPath ? (
+            <button
+              type="button"
+              onClick={() => void runExport()}
+              disabled={exporting}
+              className="h-10 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+            >
+              {exporting ? "保存中" : "保存"}
+            </button>
+          ) : null}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -515,6 +661,24 @@ function formatTimestamp(timestampMs: number) {
 
 function playbackRateLabel(value: number) {
   return `${value.toFixed(2).replace(/\.?0+$/, "")}x`;
+}
+
+function formatExtension(format: ExportFormat) {
+  return format;
+}
+
+function formatLabel(format: ExportFormat) {
+  const labels: Record<ExportFormat, string> = {
+    txt: "Text",
+    srt: "SubRip",
+    md: "Markdown",
+  };
+  return labels[format];
+}
+
+function safeFileBase(title: string) {
+  const safe = title.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+  return safe.length > 0 ? safe : "sokki-transcript";
 }
 
 function mergeSegment(current: Segment[], segment: Segment) {
