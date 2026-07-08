@@ -99,6 +99,12 @@ export interface RecordingDropsEvent {
   dropCount: number;
 }
 
+export interface RecordingLimitEvent {
+  kind: "warning" | "max_reached";
+  elapsedMs: number;
+  maxMs: number;
+}
+
 export interface SoundCheckRequest {
   source: Exclude<Source, "import">;
   micDevice?: string | null;

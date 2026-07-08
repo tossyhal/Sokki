@@ -22,6 +22,9 @@ use crate::transcription::worker::{TranscribeWorkerHandle, TranscribeWorkerState
 pub const RECORDING_LEVEL_EVENT: &str = "recording://level";
 pub const RECORDING_ELAPSED_EVENT: &str = "recording://elapsed";
 pub const RECORDING_DROPS_EVENT: &str = "recording://drops";
+pub const RECORDING_LIMIT_EVENT: &str = "recording://limit";
+pub const MAX_RECORDING_MS: u64 = 3 * 60 * 60 * 1_000;
+pub const RECORDING_LIMIT_WARNING_BEFORE_MS: u64 = 10 * 60 * 1_000;
 const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 const ELAPSED_EVENT_INTERVAL_TICKS: u64 = 5;
 const DEFAULT_VAD_THRESHOLD_DB: i32 = -40;
@@ -64,10 +67,26 @@ pub struct RecordingDropsPayload {
     pub drop_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingLimitPayload {
+    pub kind: RecordingLimitKind,
+    pub elapsed_ms: u64,
+    pub max_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingLimitKind {
+    Warning,
+    MaxReached,
+}
+
 pub trait RecordingEventSink: Send + Sync {
     fn emit_level(&self, payload: RecordingLevelPayload);
     fn emit_elapsed(&self, payload: RecordingElapsedPayload);
     fn emit_drops(&self, payload: RecordingDropsPayload);
+    fn emit_limit(&self, payload: RecordingLimitPayload);
 }
 
 pub trait RealtimeJobEnqueuer {
@@ -400,6 +419,10 @@ impl RecordingEventSink for TauriRecordingEventSink {
     fn emit_drops(&self, payload: RecordingDropsPayload) {
         let _ = self.app.emit(RECORDING_DROPS_EVENT, payload);
     }
+
+    fn emit_limit(&self, payload: RecordingLimitPayload) {
+        let _ = self.app.emit(RECORDING_LIMIT_EVENT, payload);
+    }
 }
 
 impl RecordingTiming {
@@ -433,6 +456,7 @@ fn spawn_event_thread(
     thread::spawn(move || {
         let mut tick_count = 0;
         let mut last_drop_count = 0;
+        let mut limit_state = RecordingLimitState::default();
         loop {
             match stop_rx.recv_timeout(LEVEL_EVENT_INTERVAL) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -458,6 +482,10 @@ fn spawn_event_thread(
                 events.emit_elapsed(RecordingElapsedPayload { elapsed_ms });
             }
 
+            if let Some(payload) = limit_state.next_payload(elapsed_ms) {
+                events.emit_limit(payload);
+            }
+
             let current_drop_count = drop_count.load(Ordering::Relaxed);
             if current_drop_count > last_drop_count {
                 last_drop_count = current_drop_count;
@@ -467,6 +495,39 @@ fn spawn_event_thread(
             }
         }
     })
+}
+
+#[derive(Default)]
+struct RecordingLimitState {
+    warning_sent: bool,
+    max_sent: bool,
+}
+
+impl RecordingLimitState {
+    fn next_payload(&mut self, elapsed_ms: u64) -> Option<RecordingLimitPayload> {
+        if !self.max_sent && elapsed_ms >= MAX_RECORDING_MS {
+            self.max_sent = true;
+            self.warning_sent = true;
+            return Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms,
+                max_ms: MAX_RECORDING_MS,
+            });
+        }
+
+        if !self.warning_sent
+            && elapsed_ms >= MAX_RECORDING_MS.saturating_sub(RECORDING_LIMIT_WARNING_BEFORE_MS)
+        {
+            self.warning_sent = true;
+            return Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::Warning,
+                elapsed_ms,
+                max_ms: MAX_RECORDING_MS,
+            });
+        }
+
+        None
+    }
 }
 
 fn recording_wav_path(data_dir: &Path, session_id: &str) -> PathBuf {
@@ -988,6 +1049,52 @@ mod tests {
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 
+    #[test]
+    fn recording_limit_state_warns_once_then_reports_max_once() {
+        let mut state = RecordingLimitState::default();
+
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS - 1),
+            None
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::Warning,
+                elapsed_ms: MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS + 1),
+            None
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms: MAX_RECORDING_MS,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(state.next_payload(MAX_RECORDING_MS + 1), None);
+    }
+
+    #[test]
+    fn recording_limit_state_reports_max_without_prior_warning() {
+        let mut state = RecordingLimitState::default();
+
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS + 1),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms: MAX_RECORDING_MS + 1,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(state.next_payload(MAX_RECORDING_MS + 2), None);
+    }
+
     fn sample_request(source: Source) -> StartRecordingRequest {
         StartRecordingRequest {
             source,
@@ -1043,6 +1150,7 @@ mod tests {
         levels: StdMutex<Vec<RecordingLevelPayload>>,
         elapsed: StdMutex<Vec<RecordingElapsedPayload>>,
         drops: StdMutex<Vec<RecordingDropsPayload>>,
+        limits: StdMutex<Vec<RecordingLimitPayload>>,
     }
 
     #[derive(Default)]
@@ -1076,6 +1184,10 @@ mod tests {
 
         fn emit_drops(&self, payload: RecordingDropsPayload) {
             self.drops.lock().unwrap().push(payload);
+        }
+
+        fn emit_limit(&self, payload: RecordingLimitPayload) {
+            self.limits.lock().unwrap().push(payload);
         }
     }
 

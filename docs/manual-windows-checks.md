@@ -56,6 +56,7 @@ Prerequisite: a usable local Whisper model is available.
 - Stop recording while realtime jobs are still pending and confirm the UI immediately moves to the session detail view without waiting for Whisper completion.
 - Confirm the session status is `transcribing` until pending realtime jobs finish, then changes to `done` through `session://status`.
 - Force or simulate a transcription error and confirm the session remains `error` with a visible message instead of changing to `done`.
+- For a long-running recording, confirm the 10-minute-before-limit warning appears and the 3-hour limit automatically stops recording without leaving a second active recording state.
 
 ## Existing Desktop/Device Checks Still Required
 

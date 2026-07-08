@@ -14,6 +14,7 @@ import type {
   Language,
   RecordingDropsEvent,
   RecordingElapsedEvent,
+  RecordingLimitEvent,
   RecordingLevelEvent,
   RecordingState,
   Session,
@@ -46,6 +47,7 @@ interface RecordingStore {
   starting: boolean;
   stopping: boolean;
   error: string | null;
+  durationLimitWarning: string | null;
   load: () => Promise<void>;
   setSource: (source: RecordingSource) => void;
   setLanguage: (language: Language) => void;
@@ -60,6 +62,7 @@ interface RecordingStore {
   applyLevel: (event: RecordingLevelEvent) => void;
   applyElapsed: (event: RecordingElapsedEvent) => void;
   applyDrops: (event: RecordingDropsEvent) => void;
+  applyLimit: (event: RecordingLimitEvent) => Promise<Session | null>;
   applySoundCheckLevel: (event: SoundCheckLevelEvent) => void;
 }
 
@@ -91,6 +94,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   starting: false,
   stopping: false,
   error: null,
+  durationLimitWarning: null,
 
   async load() {
     set({ loading: true, error: null });
@@ -162,6 +166,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         },
         levels: { mic: 0, system: 0 },
         dropCount: 0,
+        durationLimitWarning: null,
         starting: false,
       });
     } catch (error) {
@@ -198,6 +203,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       set({
         state: initialState,
         levels: { mic: 0, system: 0 },
+        durationLimitWarning: null,
         stopping: false,
       });
       return session;
@@ -244,6 +250,24 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set({ dropCount: event.dropCount });
   },
 
+  async applyLimit(event) {
+    if (event.kind === "warning") {
+      set({
+        durationLimitWarning: `録音は最大${formatLimit(event.maxMs)}です。あと約${formatLimit(
+          event.maxMs - event.elapsedMs,
+        )}で自動停止します。`,
+      });
+      return null;
+    }
+
+    if (!get().state.active || get().stopping) {
+      return null;
+    }
+
+    set({ durationLimitWarning: "録音が最大時間に達したため自動停止します。" });
+    return get().stop();
+  },
+
   applySoundCheckLevel(event) {
     set({ soundCheckLevels: event });
   },
@@ -254,4 +278,12 @@ function errorMessage(error: unknown) {
     return String(error.message);
   }
   return String(error);
+}
+
+function formatLimit(ms: number) {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000));
+  if (minutes >= 60 && minutes % 60 === 0) {
+    return `${minutes / 60}時間`;
+  }
+  return `${minutes}分`;
 }

@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   RecordingDropsEvent,
   RecordingElapsedEvent,
+  RecordingLimitEvent,
   RecordingLevelEvent,
   SessionStatusEvent,
   SoundCheckLevelEvent,
@@ -32,6 +33,9 @@ export async function initEventListeners() {
     }),
     await listen<RecordingDropsEvent>("recording://drops", (event) => {
       useRecordingStore.getState().applyDrops(event.payload);
+    }),
+    await listen<RecordingLimitEvent>("recording://limit", (event) => {
+      void useRecordingStore.getState().applyLimit(event.payload);
     }),
     await listen<SoundCheckLevelEvent>("soundcheck://level", (event) => {
       useRecordingStore.getState().applySoundCheckLevel(event.payload);

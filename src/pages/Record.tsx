@@ -36,6 +36,7 @@ export default function Record() {
     starting,
     stopping,
     error,
+    durationLimitWarning,
     load,
     setSource,
     setLanguage,
@@ -93,6 +94,7 @@ export default function Record() {
           micLevel={levels.mic}
           systemLevel={levels.system}
           dropCount={dropCount}
+          durationLimitWarning={durationLimitWarning}
           stopping={stopping}
           onPause={() => void pause()}
           onResume={() => void resume()}
@@ -288,6 +290,7 @@ function RecordingInProgress({
   micLevel,
   systemLevel,
   dropCount,
+  durationLimitWarning,
   stopping,
   onPause,
   onResume,
@@ -299,6 +302,7 @@ function RecordingInProgress({
   micLevel: number;
   systemLevel: number;
   dropCount: number;
+  durationLimitWarning: string | null;
   stopping: boolean;
   onPause: () => void;
   onResume: () => void;
@@ -328,6 +332,12 @@ function RecordingInProgress({
         <LevelMeter label="マイク" value={micLevel} />
         <LevelMeter label="システム音声" value={systemLevel} />
       </div>
+
+      {durationLimitWarning ? (
+        <div className="rounded-card border border-warn bg-warn-soft px-3 py-2 text-meta text-ink">
+          {durationLimitWarning}
+        </div>
+      ) : null}
 
       <div className="flex items-center justify-end gap-3 border-t border-line pt-5">
         {paused ? (
