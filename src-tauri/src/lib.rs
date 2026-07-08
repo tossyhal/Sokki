@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod export;
 pub mod import;
+pub mod models;
 pub mod recording;
 pub mod recovery;
 pub mod settings;
@@ -80,6 +81,7 @@ pub fn run() {
             commands::export_session,
             commands::get_session,
             commands::get_segments,
+            commands::get_models,
             commands::get_sessions,
             commands::get_system_info,
             commands::import_files,

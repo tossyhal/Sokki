@@ -14,6 +14,7 @@ use crate::import::{
     BatchTranscriptionInput, ImportFileResult, ImportFilesRequest, ImportPipeline,
     ImportSessionIdGenerator,
 };
+use crate::models::{get_model_inventory, ModelInfo};
 use crate::recording::{
     RecordingManager, RecordingStartDeps, RecordingStateSnapshot, StartRecordingRequest,
     TauriRecordingEventSink,
@@ -97,6 +98,15 @@ pub fn update_settings(
 #[tauri::command]
 pub fn list_audio_devices() -> Result<AudioDevices, AppError> {
     devices::list_audio_devices()
+}
+
+#[tauri::command]
+pub fn get_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    get_model_inventory(&data_dir.join(MODELS_DIR))
 }
 
 #[tauri::command]

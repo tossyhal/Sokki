@@ -24,6 +24,21 @@ export interface SystemInfo {
   dataDir: string;
 }
 
+export type ModelOrigin = "app" | "manual";
+
+export interface ModelInfo {
+  name: string;
+  fileName: string;
+  sizeBytes: number;
+  downloaded: boolean;
+  verified: boolean;
+  corrupted: boolean;
+  usable: boolean;
+  origin: ModelOrigin | null;
+  recommended: boolean;
+  description: string;
+}
+
 export interface Settings {
   defaultModel: string;
   language: Language;

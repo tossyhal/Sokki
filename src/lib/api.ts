@@ -4,6 +4,7 @@ import type {
   ExportSessionRequest,
   ImportFileResult,
   ImportFilesRequest,
+  ModelInfo,
   RecordingState,
   RetranscribeSessionRequest,
   Segment,
@@ -29,6 +30,10 @@ export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
 
 export function listAudioDevices(): Promise<AudioDevices> {
   return invoke<AudioDevices>("list_audio_devices");
+}
+
+export function getModels(): Promise<ModelInfo[]> {
+  return invoke<ModelInfo[]>("get_models");
 }
 
 export function startRecording(request: StartRecordingRequest): Promise<string> {

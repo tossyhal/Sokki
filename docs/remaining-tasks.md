@@ -20,18 +20,20 @@
   - `WhisperJobProcessor` はジョブ実行時に共有 `SettingsStore` から最新 `gpu_mode` を読む。設定変更後にワーカー再起動なしで次ジョブへ反映される。
 - `fix: run import command work on blocking thread`
   - `import_files` コマンドを `async` 化し、デコード・WAV変換・DB投入・batchジョブ投入を `spawn_blocking` 側で実行する。進捗イベントと `ImportPipeline` の処理順は既存のまま。
+- `feat: add model catalog and manifest module`
+  - `models.rs` にモデルカタログ、`models/manifest.json` 読み書き、origin を含む manifest エントリ、§6.2.1 の usable/corrupted/manual 判定、`get_models` コマンドを追加。
+  - app verified、app unverified、size mismatch corrupted、manifestなし手動配置、未DLの判定を単体テストで固定。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
 ## 残タスク
 
-### 1. モデル管理バックエンド(§15 コミット12〜15)— 未着手
+### 1. モデル管理バックエンド(§15 コミット13〜15)— 未着手
 
-- コミット12: モデルカタログ定数、`manifest.json` 読み書き(origin 含む)、§6.2.1 の usable 判定ロジック、`get_models` コマンド。判定の単体テスト(app/manual/破損/未検証の全パターン)。
 - コミット13: HF API 取得→manifest キャッシュ、streaming ダウンロード+インクリメンタル sha256、`.part`→リネーム、progress/done/error イベント、API 失敗時の verified=false 経路。
 - コミット14: `cancel_download` / `delete_model` コマンド。
 - コミット15: `verify_model` コマンド(SHA再計算+HF照合、手動配置モデルの usable 化)。
-- 現状 `src-tauri/src` に catalog/manifest 関連のモジュールは存在しない。`start_recording` 側の「usable モデルのみ許可」検証(§15 コミット26に記載)も未実装のはず — 実装時に結線すること。
+- `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§15 コミット26に記載)は未実装 — モデルDL/検証コマンド実装後に結線すること。
 
 ### 2. モデル管理フロントエンド+オンボーディング(§15 コミット16〜17)— 未着手
 
