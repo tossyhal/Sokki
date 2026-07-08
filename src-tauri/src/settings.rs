@@ -208,6 +208,11 @@ mod tests {
     #[test]
     fn load_completes_missing_keys_with_defaults() {
         let path = temp_settings_path();
+        fs::create_dir_all(
+            path.parent()
+                .expect("temporary settings path should have parent"),
+        )
+        .expect("temporary settings directory should be creatable");
         fs::write(
             &path,
             serde_json::to_string(&json!({

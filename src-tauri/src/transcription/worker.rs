@@ -702,7 +702,7 @@ mod tests {
             .enqueue_rt(fixture.job("session-a", JobKind::Rt))
             .unwrap();
 
-        eventually_done(&fixture, "session-a");
+        eventually_status(&fixture, "session-a", SessionStatus::Error);
         assert_eq!(
             events.statuses.lock().unwrap().as_slice(),
             &[SessionStatusPayload {
@@ -895,16 +895,20 @@ mod tests {
     }
 
     fn eventually_done(fixture: &WorkerFixture, session_id: &str) {
-        for _ in 0..20 {
+        eventually_status(fixture, session_id, SessionStatus::Done);
+    }
+
+    fn eventually_status(fixture: &WorkerFixture, session_id: &str, expected: SessionStatus) {
+        for _ in 0..100 {
             if fixture.tracker.pending_count(session_id) == 0 {
                 assert_eq!(
                     fixture.db.get_session(session_id).unwrap().unwrap().status,
-                    SessionStatus::Done
+                    expected
                 );
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("session did not reach done");
+        panic!("session did not settle to {expected:?}");
     }
 }

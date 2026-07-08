@@ -259,6 +259,7 @@ pub fn validate_import_file(
     available_space_bytes: u64,
 ) -> Result<ImportValidationPlan, AppError> {
     let path = path.as_ref();
+    validate_extension(path)?;
     let metadata = fs::metadata(path).map_err(io_error)?;
     let duration_ms = probe_audio_duration_ms(path)?;
     validate_import_limits(ImportValidationInput {
