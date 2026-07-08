@@ -170,7 +170,11 @@ export default function SessionDetail() {
             segments={segments}
             currentMs={currentMs}
             error={segmentError}
-            transcribing={session.status === "transcribing"}
+            liveStatus={
+              session.status === "recording" || session.status === "transcribing"
+                ? session.status
+                : null
+            }
             onSeek={(timeMs) => {
               if (audioRef.current) {
                 audioRef.current.currentTime = timeMs / 1_000;
@@ -540,17 +544,26 @@ function TranscriptView({
   segments,
   currentMs,
   error,
-  transcribing,
+  liveStatus,
   onSeek,
 }: {
   segments: Segment[];
   currentMs: number;
   error: string | null;
-  transcribing: boolean;
+  liveStatus: Extract<SessionStatus, "recording" | "transcribing"> | null;
   onSeek: (timeMs: number) => void;
 }) {
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const endRef = useRef<HTMLDivElement | null>(null);
   const hasSegments = segments.length > 0;
+  const isLive = liveStatus !== null;
+
+  useEffect(() => {
+    if (!isLive || segments.length === 0) {
+      return;
+    }
+    endRef.current?.scrollIntoView({ block: "end" });
+  }, [isLive, segments.length]);
 
   const copyAll = async () => {
     const text = segments.map((segment) => segment.text).join("\n");
@@ -567,9 +580,10 @@ function TranscriptView({
       <div className="flex items-center justify-between gap-3">
         <div>
           <h2 className="text-title">文字起こし</h2>
-          <p className="mt-1 text-meta text-ink-2">
-            {segments.length} セグメント{transcribing ? " / 処理中" : ""}
-          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-meta text-ink-2">
+            <span>{segments.length} セグメント</span>
+            {liveStatus ? <LiveTranscriptBadge status={liveStatus} /> : null}
+          </div>
         </div>
         <button
           type="button"
@@ -590,7 +604,7 @@ function TranscriptView({
       {copyStatus ? <div className="text-meta text-ink-2">{copyStatus}</div> : null}
 
       {hasSegments ? (
-        <div className="grid gap-2">
+        <div className="grid max-h-[52vh] gap-2 overflow-y-auto pr-1">
           {segments.map((segment) => {
             const active = currentMs >= segment.startMs && currentMs < segment.endMs;
             return (
@@ -611,13 +625,50 @@ function TranscriptView({
               </button>
             );
           })}
+          {isLive ? <PendingTranscriptRow status={liveStatus} /> : null}
+          <div ref={endRef} />
         </div>
       ) : (
-        <div className="rounded-card border border-line bg-surface px-4 py-6 text-body text-ink-2">
-          {transcribing ? "文字起こし中" : "文字起こしはまだありません"}
-        </div>
+        <>
+          {isLive ? (
+            <PendingTranscriptRow status={liveStatus} />
+          ) : (
+            <div className="rounded-card border border-line bg-surface px-4 py-6 text-body text-ink-2">
+              文字起こしはまだありません
+            </div>
+          )}
+        </>
       )}
     </section>
+  );
+}
+
+function LiveTranscriptBadge({
+  status,
+}: {
+  status: Extract<SessionStatus, "recording" | "transcribing">;
+}) {
+  return (
+    <span className="inline-flex h-6 items-center gap-2 rounded-btn border border-accent bg-accent-soft px-2 text-meta font-semibold text-accent">
+      <span className="h-2 w-2 rounded-full bg-accent motion-safe:animate-rec-pulse" />
+      {status === "recording" ? "ライブ録音中" : "文字起こし中"}
+    </span>
+  );
+}
+
+function PendingTranscriptRow({
+  status,
+}: {
+  status: Extract<SessionStatus, "recording" | "transcribing">;
+}) {
+  return (
+    <div className="grid grid-cols-[72px_1fr] gap-3 rounded-card border border-dashed border-line-strong bg-surface-2 px-3 py-3">
+      <span className="text-meta font-semibold text-ink-3">LIVE</span>
+      <span className="inline-flex items-center gap-2 text-body text-ink-2">
+        <span className="h-2 w-2 rounded-full bg-accent motion-safe:animate-rec-pulse" />
+        {status === "recording" ? "発話を待機中" : "次のセグメントを処理中"}
+      </span>
+    </div>
   );
 }
 

@@ -28,7 +28,9 @@ Prerequisite: at least one session has transcript segments.
 Prerequisite: a usable local Whisper model is available.
 
 - Start a microphone recording and speak continuously for at least 10 seconds.
+- Confirm the session detail transcript shows the live badge and pending row while recording/transcribing.
 - Confirm the first realtime transcript segment appears within 8 seconds plus inference time.
+- Confirm new realtime segments auto-scroll into view without obscuring the playback controls or header actions.
 - Confirm the segment around the 8-second boundary does not duplicate text from the 600ms overlap.
 - Start an import/batch transcription, then start recording while it is pending; confirm realtime recording is prioritized and the batch work resumes after recording stops.
 - Confirm the recorded WAV duration matches the recording length and the realtime transcript timestamps stay within the recorded duration.
