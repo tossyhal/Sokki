@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioDevices,
+  ExportSessionRequest,
   ImportFileResult,
   ImportFilesRequest,
   RecordingState,
@@ -76,6 +77,10 @@ export function getSegments(sessionId: string): Promise<Segment[]> {
 
 export function retranscribeSession(request: RetranscribeSessionRequest): Promise<void> {
   return invoke<void>("retranscribe_session", { request });
+}
+
+export function exportSession(request: ExportSessionRequest): Promise<void> {
+  return invoke<void>("export_session", { request });
 }
 
 export function renameSession(id: string, title: string): Promise<Session> {

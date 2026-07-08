@@ -7,6 +7,7 @@ use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
 use crate::db::{Db, Language, Segment, Session, SessionStatus};
 use crate::error::{AppError, DB_ERROR, IO_ERROR};
+use crate::export::{self, ExportFormat};
 use crate::import::{
     available_space_for_path, enqueue_batch_transcription, BatchJobEnqueuer,
     BatchTranscriptionInput, ImportFileResult, ImportFilesRequest, ImportPipeline,
@@ -43,6 +44,14 @@ pub struct RetranscribeSessionRequest {
     pub id: String,
     pub language: Language,
     pub model: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSessionRequest {
+    pub session_id: String,
+    pub format: ExportFormat,
+    pub path: String,
 }
 
 #[tauri::command]
@@ -211,6 +220,14 @@ pub fn retranscribe_session(
         settings.vad_threshold_db,
         request,
     )
+}
+
+#[tauri::command]
+pub fn export_session(
+    db: tauri::State<'_, Db>,
+    request: ExportSessionRequest,
+) -> Result<(), AppError> {
+    export::export_session(&db, &request.session_id, request.format, request.path)
 }
 
 #[tauri::command]

@@ -1,6 +1,7 @@
 export type GpuMode = "auto" | "force_cpu" | "force_gpu";
 export type Language = "ja" | "en" | "auto";
 export type Source = "mic" | "system" | "mix" | "import";
+export type ExportFormat = "txt" | "srt" | "md";
 export type SessionStatus =
   | "recording"
   | "transcribing"
@@ -137,4 +138,10 @@ export interface RetranscribeSessionRequest {
   id: string;
   language: Language;
   model: string;
+}
+
+export interface ExportSessionRequest {
+  sessionId: string;
+  format: ExportFormat;
+  path: string;
 }

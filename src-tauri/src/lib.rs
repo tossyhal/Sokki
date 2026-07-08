@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod import;
 pub mod recording;
 pub mod recovery;
@@ -65,6 +66,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::cancel_transcription,
             commands::delete_session,
+            commands::export_session,
             commands::get_session,
             commands::get_segments,
             commands::get_sessions,
