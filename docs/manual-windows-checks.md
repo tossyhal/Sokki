@@ -56,6 +56,19 @@ Prerequisite: network access to Hugging Face is available for model download and
 - Confirm the Settings default model selector only enables usable models and shows unverified app-downloaded models as selectable with an unverified label.
 - Open the Record page and confirm the model selector disables unusable models and the record button remains disabled when the selected model is not usable.
 
+## Onboarding
+
+Prerequisite: start with a fresh app data directory or set `onboardingDone` to `false` in `settings.json`.
+
+- Launch the app and confirm it redirects to `/onboarding` before the library, record, or settings pages are reachable.
+- Step through welcome, model selection, language selection, and finish.
+- On the model step, confirm `medium-q5_0` is the default/recommended selection.
+- Start a model download and confirm progress bytes update; cancel it and confirm the step remains usable.
+- Skip the model download and confirm onboarding can complete, then confirm Settings can be opened afterward.
+- Complete onboarding with a downloaded usable model and confirm the Library page opens.
+- Restart the app and confirm completed onboarding is not shown again.
+- Set `onboardingDone=false` again and confirm direct navigation to `/record` or `/settings` redirects back to onboarding.
+
 ## Realtime Transcription Pipeline
 
 Prerequisite: a usable local Whisper model is available.

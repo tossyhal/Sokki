@@ -42,15 +42,16 @@
   - `useModelStore` を追加し、`model://progress` / `model://done` / `model://error` を購読。
   - 設定画面にモデル一覧、状態バッジ、DL/キャンセル/削除/検証、DL進捗、usable モデル限定の既定モデル選択を追加。
   - 録音画面のモデル選択も backend の `get_models` 結果へ結線し、usable=false のモデルは選択・録音開始できないようにした。
+- `feat: add onboarding flow with model download step`
+  - `onboardingDone=false` 時の `/onboarding` 強制リダイレクトを追加。
+  - ようこそ、モデル選択/DL、言語既定、完了の4ステップを実装。`medium-q5_0` を既定選択し、DL進捗/キャンセル/スキップに対応。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
 ## 残タスク
 
-### 1. オンボーディング(§15 コミット17)— 未着手
+### 1. モデル usable 判定のバックエンド開始経路結線
 
-- コミット17: オンボーディング4ステップ(medium-q5_0 既定、スキップ・再試行、未完了時の強制リダイレクト)。
-  - 現状の `Onboarding.tsx` は見出しのみのプレースホルダ。
 - `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§6.2.1 / §15 コミット26に記載)は未実装。現状は Record UI での抑止のみ。
 
 ### 2. フロントエンド残ギャップ(spec §8 総点検)

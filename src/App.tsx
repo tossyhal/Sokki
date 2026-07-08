@@ -1,4 +1,4 @@
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useEffect } from "react";
 import Library from "./pages/Library";
 import Onboarding from "./pages/Onboarding";
@@ -6,6 +6,7 @@ import Record from "./pages/Record";
 import SessionDetail from "./pages/SessionDetail";
 import Settings from "./pages/Settings";
 import { initEventListeners } from "./lib/events";
+import { useSettingsStore } from "./stores/useSettingsStore";
 
 const navItems = [
   { to: "/", label: "ライブラリ" },
@@ -20,9 +21,20 @@ function navClassName({ isActive }: { isActive: boolean }) {
 }
 
 export default function App() {
+  const location = useLocation();
+  const { settings, loading, load } = useSettingsStore();
+
   useEffect(() => {
     void initEventListeners();
   }, []);
+
+  useEffect(() => {
+    if (!settings && !loading) {
+      void load();
+    }
+  }, [load, loading, settings]);
+
+  const onboardingRequired = settings ? !settings.onboardingDone : false;
 
   return (
     <div className="flex min-h-screen bg-bg text-ink">
@@ -49,14 +61,25 @@ export default function App() {
       </aside>
 
       <main className="min-w-0 flex-1">
-        <Routes>
-          <Route path="/onboarding" element={<Onboarding />} />
-          <Route path="/" element={<Library />} />
-          <Route path="/record" element={<Record />} />
-          <Route path="/session/:id" element={<SessionDetail />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        {loading && !settings ? (
+          <section className="px-8 py-7">
+            <h1 className="text-h1">Sokki</h1>
+            <p className="mt-2 text-body text-ink-2">読み込み中</p>
+          </section>
+        ) : onboardingRequired && location.pathname !== "/onboarding" ? (
+          <Navigate to="/onboarding" replace />
+        ) : !onboardingRequired && location.pathname === "/onboarding" ? (
+          <Navigate to="/" replace />
+        ) : (
+          <Routes>
+            <Route path="/onboarding" element={<Onboarding />} />
+            <Route path="/" element={<Library />} />
+            <Route path="/record" element={<Record />} />
+            <Route path="/session/:id" element={<SessionDetail />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        )}
       </main>
     </div>
   );
