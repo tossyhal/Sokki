@@ -1,12 +1,21 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, IO_ERROR};
+use crate::error::{AppError, DOWNLOAD_FAILED, IO_ERROR, MODEL_NOT_FOUND, VERIFY_FAILED};
 
 pub const MANIFEST_FILE: &str = "manifest.json";
+pub const MODEL_PROGRESS_EVENT: &str = "model://progress";
+pub const MODEL_DONE_EVENT: &str = "model://done";
+pub const MODEL_ERROR_EVENT: &str = "model://error";
+const HF_TREE_API_URL: &str = "https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main";
+const HF_RESOLVE_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +73,149 @@ pub struct ModelInfo {
     pub origin: Option<ModelOrigin>,
     pub recommended: bool,
     pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpectedModelMetadata {
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+pub trait ModelDownloadClient {
+    fn expected_metadata(
+        &self,
+        catalog: &ModelCatalogEntry,
+    ) -> Result<Option<ExpectedModelMetadata>, AppError>;
+
+    fn stream_model(
+        &self,
+        catalog: &ModelCatalogEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, AppError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProgressPayload {
+    pub name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDonePayload {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelErrorPayload {
+    pub name: String,
+    pub message: String,
+}
+
+pub trait ModelDownloadEventSink {
+    fn emit_progress(&self, payload: ModelProgressPayload);
+    fn emit_done(&self, payload: ModelDonePayload);
+    fn emit_error(&self, payload: ModelErrorPayload);
+}
+
+pub struct TauriModelDownloadEventSink {
+    app: tauri::AppHandle,
+}
+
+impl TauriModelDownloadEventSink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl ModelDownloadEventSink for TauriModelDownloadEventSink {
+    fn emit_progress(&self, payload: ModelProgressPayload) {
+        use tauri::Emitter;
+        let _ = self.app.emit(MODEL_PROGRESS_EVENT, payload);
+    }
+
+    fn emit_done(&self, payload: ModelDonePayload) {
+        use tauri::Emitter;
+        let _ = self.app.emit(MODEL_DONE_EVENT, payload);
+    }
+
+    fn emit_error(&self, payload: ModelErrorPayload) {
+        use tauri::Emitter;
+        let _ = self.app.emit(MODEL_ERROR_EVENT, payload);
+    }
+}
+
+pub struct ReqwestModelDownloadClient {
+    client: reqwest::blocking::Client,
+}
+
+impl ReqwestModelDownloadClient {
+    pub fn new() -> Result<Self, AppError> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("Sokki/0.0.0")
+            .build()
+            .map_err(download_error)?;
+        Ok(Self { client })
+    }
+}
+
+impl ModelDownloadClient for ReqwestModelDownloadClient {
+    fn expected_metadata(
+        &self,
+        catalog: &ModelCatalogEntry,
+    ) -> Result<Option<ExpectedModelMetadata>, AppError> {
+        let entries: Vec<HfTreeEntry> = self
+            .client
+            .get(HF_TREE_API_URL)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(download_error)?
+            .json()
+            .map_err(download_error)?;
+        Ok(entries
+            .into_iter()
+            .find(|entry| entry.path.as_deref() == Some(catalog.file_name))
+            .and_then(|entry| {
+                let lfs = entry.lfs?;
+                let size_bytes = entry.size.or(lfs.size)?;
+                Some(ExpectedModelMetadata {
+                    size_bytes,
+                    sha256: lfs.oid,
+                })
+            }))
+    }
+
+    fn stream_model(
+        &self,
+        catalog: &ModelCatalogEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, AppError> {
+        let url = format!("{HF_RESOLVE_BASE_URL}/{}", catalog.file_name);
+        let mut response = self
+            .client
+            .get(url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(download_error)?;
+        let bytes = std::io::copy(&mut response, writer).map_err(io_error)?;
+        Ok(bytes)
+    }
+}
+
+#[derive(Deserialize)]
+struct HfTreeEntry {
+    path: Option<String>,
+    size: Option<u64>,
+    lfs: Option<HfLfsEntry>,
+}
+
+#[derive(Deserialize)]
+struct HfLfsEntry {
+    oid: String,
+    size: Option<u64>,
 }
 
 pub fn model_catalog() -> &'static [ModelCatalogEntry] {
@@ -149,6 +301,160 @@ pub fn get_model_inventory(models_dir: &Path) -> Result<Vec<ModelInfo>, AppError
         .collect()
 }
 
+pub fn download_model_with_client(
+    models_dir: &Path,
+    name: &str,
+    client: &dyn ModelDownloadClient,
+    events: &dyn ModelDownloadEventSink,
+) -> Result<(), AppError> {
+    match download_model_inner(models_dir, name, client, events) {
+        Ok(()) => {
+            events.emit_done(ModelDonePayload {
+                name: name.to_string(),
+            });
+            Ok(())
+        }
+        Err(error) => {
+            events.emit_error(ModelErrorPayload {
+                name: name.to_string(),
+                message: error.message.clone(),
+            });
+            Err(error)
+        }
+    }
+}
+
+fn download_model_inner(
+    models_dir: &Path,
+    name: &str,
+    client: &dyn ModelDownloadClient,
+    events: &dyn ModelDownloadEventSink,
+) -> Result<(), AppError> {
+    fs::create_dir_all(models_dir).map_err(io_error)?;
+    let catalog = model_catalog()
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .ok_or_else(|| AppError::new(MODEL_NOT_FOUND, format!("unknown model: {name}")))?;
+    let expected = client.expected_metadata(catalog).unwrap_or(None);
+    let final_path = models_dir.join(catalog.file_name);
+    let part_path = models_dir.join(format!("{}.part", catalog.file_name));
+    if part_path.exists() {
+        fs::remove_file(&part_path).map_err(io_error)?;
+    }
+
+    let file = File::create(&part_path).map_err(io_error)?;
+    let mut writer = HashingProgressWriter::new(
+        file,
+        catalog.name,
+        expected.as_ref().map(|metadata| metadata.size_bytes),
+        events,
+    );
+    let streamed_bytes = match client.stream_model(catalog, &mut writer) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            drop(writer);
+            let _ = fs::remove_file(&part_path);
+            return Err(error);
+        }
+    };
+    let downloaded_bytes = writer.downloaded_bytes();
+    if streamed_bytes != downloaded_bytes {
+        drop(writer);
+        let _ = fs::remove_file(&part_path);
+        return Err(AppError::new(
+            DOWNLOAD_FAILED,
+            "download stream byte count did not match written bytes",
+        ));
+    }
+    writer.emit_progress_now();
+    let actual_sha256 = writer.finalize_hash();
+
+    if let Some(expected) = expected.as_ref() {
+        if expected.size_bytes != downloaded_bytes || !sha_eq(&expected.sha256, &actual_sha256) {
+            let _ = fs::remove_file(&part_path);
+            return Err(AppError::new(
+                VERIFY_FAILED,
+                "downloaded model failed SHA-256 or size verification",
+            ));
+        }
+    }
+
+    fs::rename(&part_path, &final_path).map_err(io_error)?;
+    let mut manifest = load_manifest(models_dir)?;
+    manifest.upsert(ModelManifestEntry {
+        name: catalog.name.to_string(),
+        file_name: catalog.file_name.to_string(),
+        size_bytes: downloaded_bytes,
+        sha256: Some(actual_sha256),
+        verified: expected.is_some(),
+        origin: ModelOrigin::App,
+    });
+    save_manifest(models_dir, &manifest)
+}
+
+struct HashingProgressWriter<'a> {
+    inner: File,
+    hasher: Sha256,
+    name: &'a str,
+    total_bytes: Option<u64>,
+    downloaded_bytes: u64,
+    last_progress: Instant,
+    events: &'a dyn ModelDownloadEventSink,
+}
+
+impl<'a> HashingProgressWriter<'a> {
+    fn new(
+        inner: File,
+        name: &'a str,
+        total_bytes: Option<u64>,
+        events: &'a dyn ModelDownloadEventSink,
+    ) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            name,
+            total_bytes,
+            downloaded_bytes: 0,
+            last_progress: Instant::now() - PROGRESS_INTERVAL,
+            events,
+        }
+    }
+
+    fn downloaded_bytes(&self) -> u64 {
+        self.downloaded_bytes
+    }
+
+    fn emit_progress_now(&mut self) {
+        self.events.emit_progress(ModelProgressPayload {
+            name: self.name.to_string(),
+            downloaded_bytes: self.downloaded_bytes,
+            total_bytes: self.total_bytes,
+        });
+        self.last_progress = Instant::now();
+    }
+
+    fn finalize_hash(mut self) -> String {
+        let _ = self.inner.flush();
+        hex_lower(self.hasher.finalize().as_slice())
+    }
+}
+
+impl Write for HashingProgressWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.downloaded_bytes += written as u64;
+        if self.last_progress.elapsed() >= PROGRESS_INTERVAL {
+            self.emit_progress_now();
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn model_info(
     models_dir: &Path,
     catalog: &ModelCatalogEntry,
@@ -195,10 +501,30 @@ fn io_error(error: std::io::Error) -> AppError {
     AppError::new(IO_ERROR, error.to_string())
 }
 
+fn download_error(error: reqwest::Error) -> AppError {
+    AppError::new(DOWNLOAD_FAILED, format!("model download failed: {error}"))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn sha_eq(expected: &str, actual: &str) -> bool {
+    expected.eq_ignore_ascii_case(actual)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -292,6 +618,128 @@ mod tests {
         let _ = fs::remove_dir_all(models_dir);
     }
 
+    #[test]
+    fn download_model_verifies_sha_renames_part_and_updates_manifest() {
+        let models_dir = temp_dir("download-success");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            })),
+            body: b"hello".to_vec(),
+            stream_error: None,
+        };
+        let events = RecordingModelEvents::default();
+
+        download_model_with_client(&models_dir, "tiny", &client, &events)
+            .expect("download should verify");
+
+        let model_path = models_dir.join("ggml-tiny.bin");
+        assert_eq!(fs::read(&model_path).unwrap(), b"hello");
+        assert!(!models_dir.join("ggml-tiny.bin.part").exists());
+        let manifest = load_manifest(&models_dir).unwrap();
+        let entry = manifest.get("tiny").expect("manifest entry should exist");
+        assert_eq!(entry.size_bytes, 5);
+        assert!(entry.verified);
+        assert_eq!(entry.origin, ModelOrigin::App);
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        assert_eq!(
+            events.events.lock().unwrap().last(),
+            Some(&ModelEvent::Done {
+                name: "tiny".to_string()
+            })
+        );
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn download_model_keeps_api_failure_as_unverified_manifest_entry() {
+        let models_dir = temp_dir("download-api-failure");
+        let client = FakeModelDownloadClient {
+            metadata: Err(AppError::new(
+                crate::error::DOWNLOAD_FAILED,
+                "hf api unavailable",
+            )),
+            body: b"hello".to_vec(),
+            stream_error: None,
+        };
+        let events = RecordingModelEvents::default();
+
+        download_model_with_client(&models_dir, "tiny", &client, &events)
+            .expect("download should continue when metadata lookup fails");
+
+        let manifest = load_manifest(&models_dir).unwrap();
+        let entry = manifest.get("tiny").expect("manifest entry should exist");
+        assert_eq!(entry.size_bytes, 5);
+        assert!(!entry.verified);
+        assert_eq!(entry.origin, ModelOrigin::App);
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn download_model_deletes_part_and_emits_error_on_verify_failure() {
+        let models_dir = temp_dir("download-verify-failure");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            })),
+            body: b"hello".to_vec(),
+            stream_error: None,
+        };
+        let events = RecordingModelEvents::default();
+
+        let error = download_model_with_client(&models_dir, "tiny", &client, &events).unwrap_err();
+
+        assert_eq!(error.code, crate::error::VERIFY_FAILED);
+        assert!(!models_dir.join("ggml-tiny.bin").exists());
+        assert!(!models_dir.join("ggml-tiny.bin.part").exists());
+        assert_eq!(load_manifest(&models_dir).unwrap().get("tiny"), None);
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ModelEvent::Error { name, message } if name == "tiny" && message.contains("SHA-256")
+        )));
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn download_model_deletes_part_and_emits_error_when_stream_fails() {
+        let models_dir = temp_dir("download-stream-failure");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            })),
+            body: b"he".to_vec(),
+            stream_error: Some(AppError::new(
+                crate::error::DOWNLOAD_FAILED,
+                "network disconnected",
+            )),
+        };
+        let events = RecordingModelEvents::default();
+
+        let error = download_model_with_client(&models_dir, "tiny", &client, &events).unwrap_err();
+
+        assert_eq!(error.code, crate::error::DOWNLOAD_FAILED);
+        assert!(!models_dir.join("ggml-tiny.bin").exists());
+        assert!(!models_dir.join("ggml-tiny.bin.part").exists());
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            ModelEvent::Error { name, message } if name == "tiny" && message.contains("network disconnected")
+        )));
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
     fn entry(
         name: &str,
         file_name: &str,
@@ -328,5 +776,79 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sokki-models-{name}-{unique}"));
         fs::create_dir_all(&path).expect("temp dir should create");
         path
+    }
+
+    struct FakeModelDownloadClient {
+        metadata: Result<Option<ExpectedModelMetadata>, AppError>,
+        body: Vec<u8>,
+        stream_error: Option<AppError>,
+    }
+
+    impl ModelDownloadClient for FakeModelDownloadClient {
+        fn expected_metadata(
+            &self,
+            _catalog: &ModelCatalogEntry,
+        ) -> Result<Option<ExpectedModelMetadata>, AppError> {
+            self.metadata.clone()
+        }
+
+        fn stream_model(
+            &self,
+            _catalog: &ModelCatalogEntry,
+            writer: &mut dyn Write,
+        ) -> Result<u64, AppError> {
+            writer
+                .write_all(&self.body)
+                .map_err(|error| AppError::new(IO_ERROR, error.to_string()))?;
+            if let Some(error) = self.stream_error.clone() {
+                return Err(error);
+            }
+            Ok(self.body.len() as u64)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum ModelEvent {
+        Progress {
+            name: String,
+            downloaded_bytes: u64,
+            total_bytes: Option<u64>,
+        },
+        Done {
+            name: String,
+        },
+        Error {
+            name: String,
+            message: String,
+        },
+    }
+
+    #[derive(Default)]
+    struct RecordingModelEvents {
+        events: Mutex<Vec<ModelEvent>>,
+    }
+
+    impl ModelDownloadEventSink for RecordingModelEvents {
+        fn emit_progress(&self, payload: ModelProgressPayload) {
+            self.events.lock().unwrap().push(ModelEvent::Progress {
+                name: payload.name,
+                downloaded_bytes: payload.downloaded_bytes,
+                total_bytes: payload.total_bytes,
+            });
+        }
+
+        fn emit_done(&self, payload: ModelDonePayload) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(ModelEvent::Done { name: payload.name });
+        }
+
+        fn emit_error(&self, payload: ModelErrorPayload) {
+            self.events.lock().unwrap().push(ModelEvent::Error {
+                name: payload.name,
+                message: payload.message,
+            });
+        }
     }
 }

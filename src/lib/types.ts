@@ -39,6 +39,21 @@ export interface ModelInfo {
   description: string;
 }
 
+export interface ModelProgressEvent {
+  name: string;
+  downloadedBytes: number;
+  totalBytes: number | null;
+}
+
+export interface ModelDoneEvent {
+  name: string;
+}
+
+export interface ModelErrorEvent {
+  name: string;
+  message: string;
+}
+
 export interface Settings {
   defaultModel: string;
   language: Language;

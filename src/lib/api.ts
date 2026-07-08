@@ -36,6 +36,10 @@ export function getModels(): Promise<ModelInfo[]> {
   return invoke<ModelInfo[]>("get_models");
 }
 
+export function downloadModel(name: string): Promise<void> {
+  return invoke<void>("download_model", { name });
+}
+
 export function startRecording(request: StartRecordingRequest): Promise<string> {
   return invoke<string>("start_recording", { request });
 }

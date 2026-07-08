@@ -78,6 +78,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::cancel_transcription,
             commands::delete_session,
+            commands::download_model,
             commands::export_session,
             commands::get_session,
             commands::get_segments,

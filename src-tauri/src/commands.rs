@@ -14,7 +14,10 @@ use crate::import::{
     BatchTranscriptionInput, ImportFileResult, ImportFilesRequest, ImportPipeline,
     ImportSessionIdGenerator,
 };
-use crate::models::{get_model_inventory, ModelInfo};
+use crate::models::{
+    download_model_with_client, get_model_inventory, ModelInfo, ReqwestModelDownloadClient,
+    TauriModelDownloadEventSink,
+};
 use crate::recording::{
     RecordingManager, RecordingStartDeps, RecordingStateSnapshot, StartRecordingRequest,
     TauriRecordingEventSink,
@@ -107,6 +110,21 @@ pub fn get_models(app: tauri::AppHandle) -> Result<Vec<ModelInfo>, AppError> {
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
     get_model_inventory(&data_dir.join(MODELS_DIR))
+}
+
+#[tauri::command]
+pub async fn download_model(app: tauri::AppHandle, name: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+        let client = ReqwestModelDownloadClient::new()?;
+        let events = TauriModelDownloadEventSink::new(app);
+        download_model_with_client(&data_dir.join(MODELS_DIR), &name, &client, &events)
+    })
+    .await
+    .map_err(|err| AppError::new(IO_ERROR, format!("model download task failed: {err}")))?
 }
 
 #[tauri::command]
