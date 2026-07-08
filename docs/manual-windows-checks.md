@@ -60,6 +60,7 @@ Prerequisite: a usable local Whisper model is available.
 ## Existing Desktop/Device Checks Still Required
 
 - Launch the generated Windows `.exe`.
+- Launch the generated Windows `.exe` twice and confirm the second launch focuses/restores the existing main window instead of opening another app window.
 - Install and launch from the NSIS installer.
 - Confirm WebView2 loads the UI.
 - Confirm microphone recording.
