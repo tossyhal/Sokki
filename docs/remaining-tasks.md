@@ -38,18 +38,20 @@
 - `feat: add verify_model command`
   - `verify_model` コマンド、SHA-256再計算、HF API metadata 照合、manifest更新、手動配置モデルの usable 化経路を追加。
   - 検証失敗したモデルは manifest に `corrupted=true` として保持し、次回 `get_models` でも破損状態として返す。
+- `feat: add model manager ui in settings`
+  - `useModelStore` を追加し、`model://progress` / `model://done` / `model://error` を購読。
+  - 設定画面にモデル一覧、状態バッジ、DL/キャンセル/削除/検証、DL進捗、usable モデル限定の既定モデル選択を追加。
+  - 録音画面のモデル選択も backend の `get_models` 結果へ結線し、usable=false のモデルは選択・録音開始できないようにした。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
 ## 残タスク
 
-### 1. モデル管理フロントエンド+オンボーディング(§15 コミット16〜17)— 未着手
+### 1. オンボーディング(§15 コミット17)— 未着手
 
-- コミット16: 設定画面のモデルマネージャUI(一覧、状態バッジ: 未DL/DL済/未検証/手動配置・未検証/破損、DL進捗、各操作ボタン、デフォルトモデル選択)、`useModelStore`。
-  - 現状の `Settings.tsx` / `Record.tsx` は固定モデル配列を使っており、`get_models` / `download_model` / `cancel_download` / `delete_model` / `verify_model` のUI結線は未実装。
-  - `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§6.2.1 / §15 コミット26に記載)も未実装。モデル管理UI実装後に同じモデル判定をバックエンド開始経路へ結線すること。
 - コミット17: オンボーディング4ステップ(medium-q5_0 既定、スキップ・再試行、未完了時の強制リダイレクト)。
   - 現状の `Onboarding.tsx` は見出しのみのプレースホルダ。
+- `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§6.2.1 / §15 コミット26に記載)は未実装。現状は Record UI での抑止のみ。
 
 ### 2. フロントエンド残ギャップ(spec §8 総点検)
 

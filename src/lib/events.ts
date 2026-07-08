@@ -4,10 +4,14 @@ import type {
   RecordingElapsedEvent,
   RecordingLimitEvent,
   RecordingLevelEvent,
+  ModelDoneEvent,
+  ModelErrorEvent,
+  ModelProgressEvent,
   Segment,
   SessionStatusEvent,
   SoundCheckLevelEvent,
 } from "./types";
+import { useModelStore } from "../stores/useModelStore";
 import { useRecordingStore } from "../stores/useRecordingStore";
 import { useSessionStore } from "../stores/useSessionStore";
 
@@ -74,6 +78,21 @@ async function registerEventListeners() {
     registered.push(
       await listen<SoundCheckLevelEvent>("soundcheck://level", (event) => {
         useRecordingStore.getState().applySoundCheckLevel(event.payload);
+      }),
+    );
+    registered.push(
+      await listen<ModelProgressEvent>("model://progress", (event) => {
+        useModelStore.getState().applyProgress(event.payload);
+      }),
+    );
+    registered.push(
+      await listen<ModelDoneEvent>("model://done", (event) => {
+        void useModelStore.getState().applyDone(event.payload.name);
+      }),
+    );
+    registered.push(
+      await listen<ModelErrorEvent>("model://error", (event) => {
+        useModelStore.getState().applyError(event.payload);
       }),
     );
     unlisteners.push(...registered);

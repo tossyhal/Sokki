@@ -1,6 +1,7 @@
 import { useEffect } from "react";
+import { usableModels, useModelStore } from "../stores/useModelStore";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import type { GpuMode, Language, SystemInfo } from "../lib/types";
+import type { GpuMode, Language, ModelInfo, SystemInfo } from "../lib/types";
 
 const languageOptions: Array<{ value: Language; label: string }> = [
   { value: "ja", label: "日本語" },
@@ -14,14 +15,43 @@ const gpuModeOptions: Array<{ value: GpuMode; label: string }> = [
   { value: "force_gpu", label: "GPU固定" },
 ];
 
-const modelOptions = ["medium-q5_0", "small-q5_0", "base-q5_0"];
-
 export default function Settings() {
   const { settings, systemInfo, loading, saving, error, load, update } = useSettingsStore();
+  const {
+    models,
+    progressByName,
+    actionByName,
+    loading: modelsLoading,
+    error: modelError,
+    load: loadModels,
+    download,
+    cancel,
+    delete: deleteModel,
+    verify,
+  } = useModelStore();
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadModels();
+  }, [load, loadModels]);
+
+  const defaultModelOptions = usableModels(models).map((model) => ({
+    value: model.name,
+    label: model.verified ? model.name : `${model.name} (未検証)`,
+  }));
+  const currentDefaultModelIsUsable = defaultModelOptions.some(
+    (option) => option.value === settings?.defaultModel,
+  );
+  const defaultModelSelectOptions =
+    settings && !currentDefaultModelIsUsable
+      ? [
+          {
+            value: settings.defaultModel,
+            label: `${settings.defaultModel} (使用不可)`,
+          },
+          ...defaultModelOptions,
+        ]
+      : defaultModelOptions;
 
   return (
     <section className="mx-auto grid max-w-4xl gap-6 px-8 py-7">
@@ -35,9 +65,9 @@ export default function Settings() {
         </div>
       </header>
 
-      {error ? (
+      {error || modelError ? (
         <div className="rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
-          {error}
+          {error ?? modelError}
         </div>
       ) : null}
 
@@ -49,7 +79,10 @@ export default function Settings() {
           </div>
           <button
             type="button"
-            onClick={() => void load()}
+            onClick={() => {
+              void load();
+              void loadModels();
+            }}
             className="rounded-btn border border-line-strong px-3 py-2 text-body text-ink hover:bg-elevate"
           >
             再読み込み
@@ -65,7 +98,8 @@ export default function Settings() {
             <SelectRow
               label="既定モデル"
               value={settings.defaultModel}
-              options={modelOptions.map((model) => ({ value: model, label: model }))}
+              options={defaultModelSelectOptions}
+              disabled={modelsLoading || defaultModelOptions.length === 0}
               onChange={(defaultModel) => void update({ defaultModel })}
             />
             <SelectRow
@@ -113,6 +147,17 @@ export default function Settings() {
         )}
       </section>
 
+      <ModelManager
+        models={models}
+        loading={modelsLoading}
+        progressByName={progressByName}
+        actionByName={actionByName}
+        onDownload={(name) => void download(name)}
+        onCancel={(name) => void cancel(name)}
+        onDelete={(name) => void deleteModel(name)}
+        onVerify={(name) => void verify(name)}
+      />
+
       <section className="border-t border-line pt-5">
         <h2 className="text-title">情報</h2>
         <div className="mt-4 grid gap-3 text-body">
@@ -132,12 +177,14 @@ function SelectRow<T extends string>({
   label,
   value,
   options,
+  disabled,
   disabledValues,
   onChange,
 }: {
   label: string;
   value: T;
   options: Array<{ value: T; label: string }>;
+  disabled?: boolean;
   disabledValues?: readonly T[];
   onChange: (value: T) => void;
 }) {
@@ -147,8 +194,12 @@ function SelectRow<T extends string>({
       <select
         value={value}
         onChange={(event) => onChange(event.currentTarget.value as T)}
+        disabled={disabled}
         className="h-10 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none hover:bg-surface-2 focus:border-ink-2"
       >
+        {options.length === 0 ? (
+          <option value={value}>利用できるモデルがありません</option>
+        ) : null}
         {options.map((option) => (
           <option
             key={option.value}
@@ -161,6 +212,179 @@ function SelectRow<T extends string>({
       </select>
     </label>
   );
+}
+
+function ModelManager({
+  models,
+  loading,
+  progressByName,
+  actionByName,
+  onDownload,
+  onCancel,
+  onDelete,
+  onVerify,
+}: {
+  models: ModelInfo[];
+  loading: boolean;
+  progressByName: Record<string, { downloadedBytes: number; totalBytes: number | null }>;
+  actionByName: Record<string, string>;
+  onDownload: (name: string) => void;
+  onCancel: (name: string) => void;
+  onDelete: (name: string) => void;
+  onVerify: (name: string) => void;
+}) {
+  return (
+    <section className="border-t border-line pt-5">
+      <div className="mb-5 flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-title">モデル</h2>
+          <p className="mt-1 text-meta text-ink-2">ローカルモデルのダウンロードと検証</p>
+        </div>
+        <div className="h-6 min-w-20 text-right text-meta text-ink-2">
+          {loading ? "読み込み中" : `${models.length}件`}
+        </div>
+      </div>
+
+      <div className="grid gap-3">
+        {models.length === 0 ? (
+          <div className="rounded-card border border-line bg-surface px-4 py-6 text-body text-ink-2">
+            モデル一覧を読み込めませんでした。
+          </div>
+        ) : null}
+        {models.map((model) => {
+          const progress = progressByName[model.name];
+          const action = actionByName[model.name];
+          const downloading = action === "download" && progress;
+          const busy = Boolean(action);
+          const canVerify = model.downloaded && (!model.verified || model.corrupted || model.origin === "manual");
+          return (
+            <article
+              key={model.name}
+              className="grid gap-3 rounded-card border border-line bg-surface px-4 py-3 shadow-card"
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-title text-ink">{model.name}</h3>
+                    {model.recommended ? (
+                      <span className="rounded-chip bg-accent-soft px-2 py-0.5 text-meta font-semibold text-accent">
+                        推奨
+                      </span>
+                    ) : null}
+                    <ModelStatusBadge model={model} />
+                  </div>
+                  <p className="mt-1 text-body text-ink-2">{model.description}</p>
+                  <p className="mt-1 text-meta text-ink-2">
+                    {model.fileName} / {formatBytes(model.sizeBytes)}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {downloading ? (
+                    <button
+                      type="button"
+                      onClick={() => onCancel(model.name)}
+                      className="h-9 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+                      disabled={action === "cancel"}
+                    >
+                      {action === "cancel" ? "中断中" : "キャンセル"}
+                    </button>
+                  ) : !model.downloaded ? (
+                    <button
+                      type="button"
+                      onClick={() => onDownload(model.name)}
+                      className="h-9 rounded-btn bg-accent px-3 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+                      disabled={busy}
+                    >
+                      {action === "download" ? "DL中" : "DL"}
+                    </button>
+                  ) : null}
+                  {canVerify ? (
+                    <button
+                      type="button"
+                      onClick={() => onVerify(model.name)}
+                      className="h-9 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+                      disabled={busy}
+                    >
+                      {action === "verify" ? "検証中" : "検証"}
+                    </button>
+                  ) : null}
+                  {model.downloaded ? (
+                    <button
+                      type="button"
+                      onClick={() => onDelete(model.name)}
+                      className="h-9 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+                      disabled={busy}
+                    >
+                      {action === "delete" ? "削除中" : "削除"}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+              {progress ? (
+                <div className="grid gap-1">
+                  <div className="h-2 overflow-hidden rounded-chip bg-elevate">
+                    <div
+                      className="h-full bg-accent"
+                      style={{ width: `${progressPercent(progress)}%` }}
+                    />
+                  </div>
+                  <p className="text-meta text-ink-2">
+                    {formatBytes(progress.downloadedBytes)}
+                    {progress.totalBytes ? ` / ${formatBytes(progress.totalBytes)}` : ""}
+                  </p>
+                </div>
+              ) : null}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ModelStatusBadge({ model }: { model: ModelInfo }) {
+  const status = modelStatus(model);
+  return (
+    <span className={`rounded-chip px-2 py-0.5 text-meta font-semibold ${status.className}`}>
+      {status.label}
+    </span>
+  );
+}
+
+function modelStatus(model: ModelInfo) {
+  if (!model.downloaded) {
+    return { label: "未DL", className: "bg-elevate text-ink-2" };
+  }
+  if (model.corrupted) {
+    return { label: "破損", className: "bg-accent-soft text-accent" };
+  }
+  if (model.origin === "manual" && !model.verified) {
+    return { label: "手動配置・未検証", className: "bg-warn-soft text-warn" };
+  }
+  if (!model.verified) {
+    return { label: "未検証", className: "bg-warn-soft text-warn" };
+  }
+  return { label: "DL済", className: "bg-elevate text-ink" };
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${Math.round(bytes / 1024 / 1024)}MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)}KB`;
+  }
+  return `${bytes}B`;
+}
+
+function progressPercent(progress: { downloadedBytes: number; totalBytes: number | null }) {
+  if (!progress.totalBytes || progress.totalBytes <= 0) {
+    return 100;
+  }
+  return Math.max(2, Math.min(100, (progress.downloadedBytes / progress.totalBytes) * 100));
 }
 
 function GpuModeRow({

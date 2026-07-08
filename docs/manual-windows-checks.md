@@ -42,6 +42,20 @@ Prerequisite: at least one session has transcript segments.
 - Cancel the native save dialog and confirm no file is written and the dialog remains usable.
 - Try exporting to an unwritable location and confirm an error is shown without crashing the app.
 
+## Model Management
+
+Prerequisite: network access to Hugging Face is available for model download and verification checks.
+
+- Open Settings and confirm the model list shows all catalog entries with status badges: not downloaded, downloaded, unverified, manual/unverified, or corrupted as applicable.
+- Start a model download and confirm `model://progress` updates the progress bar and downloaded byte text.
+- Cancel an in-progress download and confirm the progress row clears, the UI remains usable, and a later retry starts from the beginning.
+- Complete a model download and confirm the status changes without restarting the app.
+- Delete a downloaded model and confirm the row returns to not downloaded.
+- Place a model file manually in the app models directory, click verify, and confirm a successful SHA-256 match makes it selectable for recording.
+- Attempt verification with a mismatched or truncated model file and confirm the status becomes corrupted and the model is not selectable for recording.
+- Confirm the Settings default model selector only enables usable models and shows unverified app-downloaded models as selectable with an unverified label.
+- Open the Record page and confirm the model selector disables unusable models and the record button remains disabled when the selected model is not usable.
+
 ## Realtime Transcription Pipeline
 
 Prerequisite: a usable local Whisper model is available.

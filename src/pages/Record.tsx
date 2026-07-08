@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { formatDuration } from "../lib/format";
+import { useModelStore } from "../stores/useModelStore";
 import { useRecordingStore } from "../stores/useRecordingStore";
-import type { AudioDevice, Language, SoundCheckResult, Source } from "../lib/types";
+import type { AudioDevice, Language, ModelInfo, SoundCheckResult, Source } from "../lib/types";
 
 type RecordingSource = Exclude<Source, "import">;
 
@@ -19,10 +20,14 @@ const languageOptions: Array<{ value: Language; label: string }> = [
   { value: "auto", label: "自動判別" },
 ];
 
-const modelOptions = ["medium-q5_0", "small-q5_0", "base-q5_0"];
-
 export default function Record() {
   const navigate = useNavigate();
+  const {
+    models,
+    loading: modelsLoading,
+    error: modelError,
+    load: loadModels,
+  } = useModelStore();
   const {
     devices,
     state,
@@ -52,14 +57,29 @@ export default function Record() {
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadModels();
+  }, [load, loadModels]);
 
   const needsMic = setup.source === "mic" || setup.source === "mix";
   const needsSystem = setup.source === "system" || setup.source === "mix";
+  const selectedModel = models.find((model) => model.name === setup.model);
+  const selectedModelUsable = Boolean(selectedModel?.usable && !selectedModel.corrupted);
+  const modelOptions =
+    models.length > 0
+      ? models.map((model) => ({
+          value: model.name,
+          label: modelSelectLabel(model),
+        }))
+      : [{ value: setup.model, label: `${setup.model} (未読込)` }];
+  const disabledModels = models
+    .filter((model) => !model.usable || model.corrupted)
+    .map((model) => model.name);
   const canStart =
     !loading &&
+    !modelsLoading &&
     !starting &&
     !state.active &&
+    selectedModelUsable &&
     (!needsMic || Boolean(devices?.inputs.length)) &&
     (!needsSystem || Boolean(devices?.outputs.length));
 
@@ -80,9 +100,9 @@ export default function Record() {
         </button>
       </header>
 
-      {error ? (
+      {error || modelError ? (
         <div className="rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
-          {error}
+          {error ?? modelError}
         </div>
       ) : null}
 
@@ -172,10 +192,14 @@ export default function Record() {
             <SelectRow
               label="モデル"
               value={setup.model}
-              options={modelOptions.map((model) => ({ value: model, label: model }))}
-              disabled={loading}
+              options={modelOptions}
+              disabled={loading || modelsLoading}
+              disabledValues={disabledModels}
               onChange={setModel}
             />
+            {!selectedModelUsable ? (
+              <DeviceWarning message="使用可能なモデルを設定画面でダウンロードまたは検証してください。" />
+            ) : null}
           </div>
 
           <div className="flex items-center justify-between border-t border-line pt-5">
@@ -409,12 +433,14 @@ function SelectRow<T extends string>({
   value,
   options,
   disabled,
+  disabledValues,
   onChange,
 }: {
   label: string;
   value: T;
   options: Array<{ value: T; label: string }>;
   disabled?: boolean;
+  disabledValues?: readonly T[];
   onChange: (value: T) => void;
 }) {
   return (
@@ -427,7 +453,11 @@ function SelectRow<T extends string>({
         className="h-10 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none hover:bg-surface-2 focus:border-ink-2 disabled:text-ink-3"
       >
         {options.map((option) => (
-          <option key={option.value} value={option.value}>
+          <option
+            key={option.value}
+            value={option.value}
+            disabled={disabledValues?.includes(option.value)}
+          >
             {option.label}
           </option>
         ))}
@@ -444,6 +474,22 @@ function deviceOptions(devices: AudioDevice[]) {
       label: device.isDefault ? `${device.name} / 既定` : device.name,
     })),
   ];
+}
+
+function modelSelectLabel(model: ModelInfo) {
+  if (!model.downloaded) {
+    return `${model.name} / 未DL`;
+  }
+  if (model.corrupted) {
+    return `${model.name} / 破損`;
+  }
+  if (model.origin === "manual" && !model.verified) {
+    return `${model.name} / 手動配置・未検証`;
+  }
+  if (!model.verified) {
+    return `${model.name} / 未検証`;
+  }
+  return model.name;
 }
 
 function deviceSummary(inputCount: number | undefined, outputCount: number | undefined) {
