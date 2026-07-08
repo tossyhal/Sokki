@@ -481,6 +481,56 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_prioritizes_rt_and_reprocesses_deferred_batch_after_recording_stops() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("session-a");
+        let (processed_tx, processed_rx) = processed_channel();
+        let processor = Arc::new(AbortFirstBatchProcessor {
+            processed_tx,
+            attempt: AtomicUsize::new(0),
+            recording_active: Arc::clone(&fixture.recording_active),
+        });
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+            noop_events(),
+        );
+
+        worker
+            .enqueue_batch(fixture.job("session-a", JobKind::Batch))
+            .unwrap();
+        assert_eq!(
+            processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first batch attempt should run"),
+            ("session-a".to_string(), JobKind::Batch)
+        );
+        assert!(fixture.recording_active.load(Ordering::SeqCst));
+
+        worker
+            .enqueue_rt(fixture.job("session-a", JobKind::Rt))
+            .unwrap();
+        assert_eq!(
+            processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("rt job should preempt deferred batch while recording"),
+            ("session-a".to_string(), JobKind::Rt)
+        );
+
+        fixture.recording_active.store(false, Ordering::SeqCst);
+        assert_eq!(
+            processed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("deferred batch should resume after recording stops"),
+            ("session-a".to_string(), JobKind::Batch)
+        );
+        eventually_done(&fixture, "session-a");
+        worker.shutdown();
+    }
+
+    #[test]
     fn canceled_deferred_job_is_skipped_and_finished() {
         let fixture = WorkerFixture::new();
         fixture.insert_session("batch-session");
