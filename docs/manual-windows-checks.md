@@ -69,6 +69,17 @@ Prerequisite: start with a fresh app data directory or set `onboardingDone` to `
 - Restart the app and confirm completed onboarding is not shown again.
 - Set `onboardingDone=false` again and confirm direct navigation to `/record` or `/settings` redirects back to onboarding.
 
+## Import Dialog
+
+Prerequisite: at least one usable local Whisper model is available.
+
+- Open Library and click `インポート`; confirm the native Windows open dialog appears with audio file filters.
+- Select one valid audio file and confirm an import result row reports success and the Library session list refreshes.
+- Select multiple files where at least one is invalid or unsupported and confirm each failed file is shown with its file name, error code, and reason.
+- Cancel the native open dialog and confirm no import starts and no stale result is shown.
+- Remove or corrupt all usable models and confirm clicking `インポート` shows a settings guidance message instead of opening a broken import flow.
+- Confirm the frontend never asks for a save path or constructs an app-data recording path; imported file paths are only passed to the Rust `import_files` command.
+
 ## Realtime Transcription Pipeline
 
 Prerequisite: a usable local Whisper model is available.

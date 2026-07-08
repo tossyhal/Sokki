@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useNavigate } from "react-router-dom";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { importFiles } from "../lib/api";
 import { formatDuration } from "../lib/format";
-import type { Session, SessionStatus, Source } from "../lib/types";
+import type { ImportFileResult, ModelInfo, Session, SessionStatus, Source } from "../lib/types";
+import { usableModels, useModelStore } from "../stores/useModelStore";
 import { useSessionStore } from "../stores/useSessionStore";
+import { useSettingsStore } from "../stores/useSettingsStore";
 
 export default function Library() {
   const navigate = useNavigate();
+  const { settings, load: loadSettings } = useSettingsStore();
+  const { models, loading: modelsLoading, error: modelError, load: loadModels } = useModelStore();
   const {
     sessions,
     loading,
@@ -20,10 +26,68 @@ export default function Library() {
     delete: deleteSession,
   } = useSessionStore();
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResults, setImportResults] = useState<ImportFileResult[]>([]);
+  const [importError, setImportError] = useState<string | null>(null);
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadSettings();
+    void loadModels();
+  }, [load, loadModels, loadSettings]);
+
+  const importModel = selectImportModel(models, settings?.defaultModel);
+  const importDisabled = loading || importing || modelsLoading;
+
+  async function handleImport() {
+    setImportError(null);
+    setImportResults([]);
+
+    if (!settings) {
+      setImportError("設定を読み込み中です。少し待ってから再試行してください。");
+      return;
+    }
+    if (!importModel) {
+      setImportError("使用可能なモデルがありません。設定でモデルをダウンロードまたは検証してください。");
+      return;
+    }
+
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        multiple: true,
+        directory: false,
+        filters: [
+          {
+            name: "Audio",
+            extensions: ["wav", "mp3", "m4a", "aac", "flac", "ogg"],
+          },
+        ],
+      });
+    } catch (error) {
+      setImportError(errorMessage(error));
+      return;
+    }
+    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    if (paths.length === 0) {
+      return;
+    }
+
+    setImporting(true);
+    try {
+      const results = await importFiles({
+        paths,
+        language: settings.language,
+        model: importModel.name,
+      });
+      setImportResults(results);
+      await load();
+    } catch (error) {
+      setImportError(errorMessage(error));
+    } finally {
+      setImporting(false);
+    }
+  }
 
   return (
     <section className="grid gap-6 px-8 py-7">
@@ -32,21 +96,42 @@ export default function Library() {
           <h1 className="text-h1">ライブラリ</h1>
           <p className="mt-1 text-meta text-ink-2">{sessions.length} 件</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void load()}
-          disabled={loading}
-          className="h-10 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
-        >
-          更新
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleImport()}
+            disabled={importDisabled}
+            className="h-10 rounded-btn bg-accent px-4 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+          >
+            {importing ? "インポート中" : "インポート"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            className="h-10 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+          >
+            更新
+          </button>
+        </div>
       </div>
 
-      {error ? (
+      {error || modelError || importError ? (
         <div className="rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
-          {error}
+          {error ?? modelError ?? importError}
+          {importError && !importModel ? (
+            <button
+              type="button"
+              onClick={() => navigate("/settings")}
+              className="ml-3 h-8 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate"
+            >
+              設定を開く
+            </button>
+          ) : null}
         </div>
       ) : null}
+
+      {importResults.length > 0 ? <ImportResultList results={importResults} /> : null}
 
       {loading && sessions.length === 0 ? (
         <div className="border-t border-line py-8 text-body text-ink-2">読み込み中</div>
@@ -99,6 +184,39 @@ export default function Library() {
           }}
         />
       ) : null}
+    </section>
+  );
+}
+
+function ImportResultList({ results }: { results: ImportFileResult[] }) {
+  const succeeded = results.filter((result) => result.ok).length;
+  const failed = results.length - succeeded;
+
+  return (
+    <section className="grid gap-3 rounded-card border border-line bg-surface px-4 py-3">
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="text-title text-ink">インポート結果</h2>
+        <span className="text-meta text-ink-2">
+          成功 {succeeded} / 失敗 {failed}
+        </span>
+      </div>
+      <div className="grid gap-2">
+        {results.map((result) => (
+          <div
+            key={`${result.path}-${result.sessionId ?? result.errorCode ?? "result"}`}
+            className={`rounded-card border px-3 py-2 text-meta ${
+              result.ok ? "border-line bg-surface-2 text-ink-2" : "border-warn bg-warn-soft text-ink"
+            }`}
+          >
+            <div className="break-all font-semibold text-ink">{fileName(result.path)}</div>
+            <div className="mt-1 break-words">
+              {result.ok
+                ? `セッション ${result.sessionId ?? "-"} を作成しました`
+                : `${result.errorCode ?? "ERROR"}: ${result.errorMessage ?? "インポートに失敗しました"}`}
+            </div>
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
@@ -264,4 +382,20 @@ function formatDate(timestampMs: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(timestampMs));
+}
+
+function selectImportModel(models: ModelInfo[], defaultModel: string | undefined) {
+  const usable = usableModels(models);
+  return usable.find((model) => model.name === defaultModel) ?? usable[0] ?? null;
+}
+
+function fileName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function errorMessage(error: unknown) {
+  if (error && typeof error === "object" && "message" in error) {
+    return String(error.message);
+  }
+  return String(error);
 }

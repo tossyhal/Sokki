@@ -48,6 +48,10 @@
 - `fix: enforce usable models in backend start paths`
   - `start_recording` / `import_files` / `retranscribe_session` の開始時に backend 側でも `get_model_inventory` ベースの usable 判定を実施。
   - 未DLは `MODEL_NOT_FOUND`、破損は `MODEL_CORRUPTED`、手動配置未検証など usable=false は `MODEL_UNVERIFIED` として開始前に拒否。
+- `feat: add library import UI with per-file results`
+  - Library ヘッダに native open dialog 経由の `import_files` 導線を追加。
+  - usable な既定モデル(なければ先頭 usable モデル)を使って import し、`ImportFileResult[]` の成功/失敗をファイル名・エラーコード・理由付きで画面表示する。
+  - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -56,9 +60,9 @@
 ### 1. フロントエンド残ギャップ(spec §8 総点検)
 
 - §8 の画面仕様と現実装の突き合わせ。少なくとも以下を確認:
-  - Record ページ: モデル選択が usable のみ活性になっているか(モデル管理実装後)。
-  - `recording://limit` 警告(残10分)のUI表示。
+  - Record ページ: モデル選択は usable のみ活性、`recording://limit` 警告表示、サウンドチェック再生UIは実装済み。Windows実機で操作確認が必要。
   - サウンドチェック結果の再生ゲート(§9、`$APPDATA` scope)が実機で通るか。
+  - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
 - 完了後、§13 受入チェックリストを `docs/acceptance.md` に記録(コミット62)。
 
 ### 2. M6 残タスク(§15 コミット60〜62)
