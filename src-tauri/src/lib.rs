@@ -72,12 +72,15 @@ pub fn run() {
                 worker,
             )));
             app.manage(import::ImportSessionIdGenerator::new());
+            app.manage(models::ModelDownloadManager::new());
             log::info!("Sokki app data directory: {}", data_dir.display());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::cancel_transcription,
+            commands::cancel_download,
             commands::delete_session,
+            commands::delete_model,
             commands::download_model,
             commands::export_session,
             commands::get_session,

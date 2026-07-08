@@ -15,8 +15,8 @@ use crate::import::{
     ImportSessionIdGenerator,
 };
 use crate::models::{
-    download_model_with_client, get_model_inventory, ModelInfo, ReqwestModelDownloadClient,
-    TauriModelDownloadEventSink,
+    delete_model as delete_model_file, download_model_with_client_and_cancel, get_model_inventory,
+    ModelDownloadManager, ModelInfo, ReqwestModelDownloadClient, TauriModelDownloadEventSink,
 };
 use crate::recording::{
     RecordingManager, RecordingStartDeps, RecordingStateSnapshot, StartRecordingRequest,
@@ -119,12 +119,41 @@ pub async fn download_model(app: tauri::AppHandle, name: String) -> Result<(), A
             .path()
             .app_data_dir()
             .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
-        let client = ReqwestModelDownloadClient::new()?;
-        let events = TauriModelDownloadEventSink::new(app);
-        download_model_with_client(&data_dir.join(MODELS_DIR), &name, &client, &events)
+        let manager = app.state::<ModelDownloadManager>();
+        let canceled = manager.start(&name)?;
+        let result = (|| {
+            let client = ReqwestModelDownloadClient::new()?;
+            let events = TauriModelDownloadEventSink::new(app.clone());
+            download_model_with_client_and_cancel(
+                &data_dir.join(MODELS_DIR),
+                &name,
+                &client,
+                &events,
+                canceled,
+            )
+        })();
+        manager.finish(&name);
+        result
     })
     .await
     .map_err(|err| AppError::new(IO_ERROR, format!("model download task failed: {err}")))?
+}
+
+#[tauri::command]
+pub fn cancel_download(
+    manager: tauri::State<'_, ModelDownloadManager>,
+    name: String,
+) -> Result<(), AppError> {
+    manager.cancel(&name)
+}
+
+#[tauri::command]
+pub fn delete_model(app: tauri::AppHandle, name: String) -> Result<ModelInfo, AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    delete_model_file(&data_dir.join(MODELS_DIR), &name)
 }
 
 #[tauri::command]

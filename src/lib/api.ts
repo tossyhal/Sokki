@@ -40,6 +40,14 @@ export function downloadModel(name: string): Promise<void> {
   return invoke<void>("download_model", { name });
 }
 
+export function cancelDownload(name: string): Promise<void> {
+  return invoke<void>("cancel_download", { name });
+}
+
+export function deleteModel(name: string): Promise<ModelInfo> {
+  return invoke<ModelInfo>("delete_model", { name });
+}
+
 export function startRecording(request: StartRecordingRequest): Promise<string> {
   return invoke<string>("start_recording", { request });
 }

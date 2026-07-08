@@ -26,14 +26,16 @@
 - `feat: add model download with streaming sha256 verification`
   - `download_model` コマンド、`model://progress` / `model://done` / `model://error` イベント、HF API metadata 取得、`.part` への streaming download、インクリメンタル SHA-256、完了時 manifest 更新を追加。
   - HF API metadata 取得失敗時はDLを継続し、実サイズ/実SHAで `verified=false, origin=app` として manifest に保存する。検証失敗・stream失敗時は `.part` を削除する。
+- `feat: add cancel download and delete model commands`
+  - `ModelDownloadManager` でモデルごとのアクティブDLとキャンセルフラグを管理し、重複DLを `MODEL_ALREADY_DOWNLOADING` で拒否。
+  - `cancel_download` は進行中DLへキャンセルフラグを立て、stream write 経路で `CANCELED` として中断し `.part` を削除する。`delete_model` はモデル本体/`.part`/manifestエントリを削除し、更新後の `ModelInfo` を返す。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
 ## 残タスク
 
-### 1. モデル管理バックエンド(§15 コミット14〜15)— 未着手
+### 1. モデル管理バックエンド(§15 コミット15)— 未着手
 
-- コミット14: `cancel_download` / `delete_model` コマンド。
 - コミット15: `verify_model` コマンド(SHA再計算+HF照合、手動配置モデルの usable 化)。
 - `start_recording` / `import_files` / `retranscribe_session` 側の「usable モデルのみ許可」検証(§15 コミット26に記載)は未実装 — モデルDL/検証コマンド実装後に結線すること。
 

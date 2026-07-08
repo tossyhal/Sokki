@@ -1,13 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, DOWNLOAD_FAILED, IO_ERROR, MODEL_NOT_FOUND, VERIFY_FAILED};
+use crate::error::{
+    AppError, CANCELED, DOWNLOAD_FAILED, IO_ERROR, MODEL_ALREADY_DOWNLOADING, MODEL_NOT_FOUND,
+    VERIFY_FAILED,
+};
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const MODEL_PROGRESS_EVENT: &str = "model://progress";
@@ -57,6 +62,10 @@ impl ModelManifest {
 
     pub fn upsert(&mut self, entry: ModelManifestEntry) {
         self.models.insert(entry.name.clone(), entry);
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.models.remove(name);
     }
 }
 
@@ -152,6 +161,55 @@ pub struct ReqwestModelDownloadClient {
     client: reqwest::blocking::Client,
 }
 
+#[derive(Clone, Default)]
+pub struct ModelDownloadManager {
+    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+impl ModelDownloadManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn start(&self, name: &str) -> Result<Arc<AtomicBool>, AppError> {
+        let mut active = self
+            .active
+            .lock()
+            .expect("model download mutex should not be poisoned");
+        if active.contains_key(name) {
+            return Err(AppError::new(
+                MODEL_ALREADY_DOWNLOADING,
+                format!("model is already downloading: {name}"),
+            ));
+        }
+        let canceled = Arc::new(AtomicBool::new(false));
+        active.insert(name.to_string(), Arc::clone(&canceled));
+        Ok(canceled)
+    }
+
+    pub fn finish(&self, name: &str) {
+        self.active
+            .lock()
+            .expect("model download mutex should not be poisoned")
+            .remove(name);
+    }
+
+    pub fn cancel(&self, name: &str) -> Result<(), AppError> {
+        let active = self
+            .active
+            .lock()
+            .expect("model download mutex should not be poisoned");
+        let Some(flag) = active.get(name) else {
+            return Err(AppError::new(
+                CANCELED,
+                format!("model download is not active: {name}"),
+            ));
+        };
+        flag.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 impl ReqwestModelDownloadClient {
     pub fn new() -> Result<Self, AppError> {
         let client = reqwest::blocking::Client::builder()
@@ -200,7 +258,7 @@ impl ModelDownloadClient for ReqwestModelDownloadClient {
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(download_error)?;
-        let bytes = std::io::copy(&mut response, writer).map_err(io_error)?;
+        let bytes = std::io::copy(&mut response, writer).map_err(download_io_error)?;
         Ok(bytes)
     }
 }
@@ -307,7 +365,23 @@ pub fn download_model_with_client(
     client: &dyn ModelDownloadClient,
     events: &dyn ModelDownloadEventSink,
 ) -> Result<(), AppError> {
-    match download_model_inner(models_dir, name, client, events) {
+    download_model_with_client_and_cancel(
+        models_dir,
+        name,
+        client,
+        events,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+pub fn download_model_with_client_and_cancel(
+    models_dir: &Path,
+    name: &str,
+    client: &dyn ModelDownloadClient,
+    events: &dyn ModelDownloadEventSink,
+    canceled: Arc<AtomicBool>,
+) -> Result<(), AppError> {
+    match download_model_inner(models_dir, name, client, events, canceled) {
         Ok(()) => {
             events.emit_done(ModelDonePayload {
                 name: name.to_string(),
@@ -329,6 +403,7 @@ fn download_model_inner(
     name: &str,
     client: &dyn ModelDownloadClient,
     events: &dyn ModelDownloadEventSink,
+    canceled: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     fs::create_dir_all(models_dir).map_err(io_error)?;
     let catalog = model_catalog()
@@ -348,6 +423,7 @@ fn download_model_inner(
         catalog.name,
         expected.as_ref().map(|metadata| metadata.size_bytes),
         events,
+        canceled,
     );
     let streamed_bytes = match client.stream_model(catalog, &mut writer) {
         Ok(bytes) => bytes,
@@ -392,6 +468,21 @@ fn download_model_inner(
     save_manifest(models_dir, &manifest)
 }
 
+pub fn delete_model(models_dir: &Path, name: &str) -> Result<ModelInfo, AppError> {
+    let catalog = model_catalog()
+        .iter()
+        .find(|catalog| catalog.name == name)
+        .ok_or_else(|| AppError::new(MODEL_NOT_FOUND, format!("unknown model: {name}")))?;
+    let model_path = models_dir.join(catalog.file_name);
+    let part_path = models_dir.join(format!("{}.part", catalog.file_name));
+    remove_if_exists(&model_path)?;
+    remove_if_exists(&part_path)?;
+    let mut manifest = load_manifest(models_dir)?;
+    manifest.remove(name);
+    save_manifest(models_dir, &manifest)?;
+    model_info(models_dir, catalog, manifest.get(name))
+}
+
 struct HashingProgressWriter<'a> {
     inner: File,
     hasher: Sha256,
@@ -400,6 +491,7 @@ struct HashingProgressWriter<'a> {
     downloaded_bytes: u64,
     last_progress: Instant,
     events: &'a dyn ModelDownloadEventSink,
+    canceled: Arc<AtomicBool>,
 }
 
 impl<'a> HashingProgressWriter<'a> {
@@ -408,6 +500,7 @@ impl<'a> HashingProgressWriter<'a> {
         name: &'a str,
         total_bytes: Option<u64>,
         events: &'a dyn ModelDownloadEventSink,
+        canceled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner,
@@ -417,6 +510,7 @@ impl<'a> HashingProgressWriter<'a> {
             downloaded_bytes: 0,
             last_progress: Instant::now() - PROGRESS_INTERVAL,
             events,
+            canceled,
         }
     }
 
@@ -441,6 +535,12 @@ impl<'a> HashingProgressWriter<'a> {
 
 impl Write for HashingProgressWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.canceled.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "model download canceled",
+            ));
+        }
         let written = self.inner.write(buf)?;
         self.hasher.update(&buf[..written]);
         self.downloaded_bytes += written as u64;
@@ -501,8 +601,24 @@ fn io_error(error: std::io::Error) -> AppError {
     AppError::new(IO_ERROR, error.to_string())
 }
 
+fn download_io_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        AppError::new(CANCELED, error.to_string())
+    } else {
+        AppError::new(DOWNLOAD_FAILED, format!("model download failed: {error}"))
+    }
+}
+
 fn download_error(error: reqwest::Error) -> AppError {
     AppError::new(DOWNLOAD_FAILED, format!("model download failed: {error}"))
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -740,6 +856,67 @@ mod tests {
         let _ = fs::remove_dir_all(models_dir);
     }
 
+    #[test]
+    fn download_model_respects_cancel_flag_and_removes_part() {
+        let models_dir = temp_dir("download-canceled");
+        let client = FakeModelDownloadClient {
+            metadata: Ok(Some(ExpectedModelMetadata {
+                size_bytes: 5,
+                sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+                    .to_string(),
+            })),
+            body: b"hello".to_vec(),
+            stream_error: None,
+        };
+        let events = RecordingModelEvents::default();
+        let canceled = Arc::new(AtomicBool::new(true));
+
+        let error =
+            download_model_with_client_and_cancel(&models_dir, "tiny", &client, &events, canceled)
+                .unwrap_err();
+
+        assert_eq!(error.code, CANCELED);
+        assert!(!models_dir.join("ggml-tiny.bin").exists());
+        assert!(!models_dir.join("ggml-tiny.bin.part").exists());
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn model_download_manager_rejects_duplicate_and_sets_cancel_flag() {
+        let manager = ModelDownloadManager::new();
+
+        let flag = manager.start("tiny").expect("first download should start");
+        let duplicate = manager.start("tiny").unwrap_err();
+        manager
+            .cancel("tiny")
+            .expect("active download should cancel");
+
+        assert_eq!(duplicate.code, MODEL_ALREADY_DOWNLOADING);
+        assert!(flag.load(Ordering::SeqCst));
+        manager.finish("tiny");
+        assert!(manager.start("tiny").is_ok());
+    }
+
+    #[test]
+    fn delete_model_removes_file_part_and_manifest_entry() {
+        let models_dir = temp_dir("delete-model");
+        write_file(&models_dir.join("ggml-tiny.bin"), 5);
+        write_file(&models_dir.join("ggml-tiny.bin.part"), 2);
+        let mut manifest = ModelManifest::default();
+        manifest.upsert(entry("tiny", "ggml-tiny.bin", 5, true, ModelOrigin::App));
+        save_manifest(&models_dir, &manifest).expect("manifest should save");
+
+        let info = delete_model(&models_dir, "tiny").expect("model should delete");
+        let manifest = load_manifest(&models_dir).expect("manifest should load");
+
+        assert!(!models_dir.join("ggml-tiny.bin").exists());
+        assert!(!models_dir.join("ggml-tiny.bin.part").exists());
+        assert_eq!(manifest.get("tiny"), None);
+        assert!(!info.downloaded);
+        assert!(!info.usable);
+        let _ = fs::remove_dir_all(models_dir);
+    }
+
     fn entry(
         name: &str,
         file_name: &str,
@@ -797,9 +974,7 @@ mod tests {
             _catalog: &ModelCatalogEntry,
             writer: &mut dyn Write,
         ) -> Result<u64, AppError> {
-            writer
-                .write_all(&self.body)
-                .map_err(|error| AppError::new(IO_ERROR, error.to_string()))?;
+            writer.write_all(&self.body).map_err(download_io_error)?;
             if let Some(error) = self.stream_error.clone() {
                 return Err(error);
             }
