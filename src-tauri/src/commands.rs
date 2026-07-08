@@ -250,13 +250,19 @@ pub async fn run_sound_check(
 }
 
 #[tauri::command]
-pub fn import_files(
+pub async fn import_files(
     app: tauri::AppHandle,
-    db: tauri::State<'_, Db>,
-    settings_store: tauri::State<'_, SettingsStore>,
-    tracker: tauri::State<'_, Arc<JobTracker>>,
-    worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
-    id_generator: tauri::State<'_, ImportSessionIdGenerator>,
+    request: ImportFilesRequest,
+) -> Result<Vec<ImportFileResult>, AppError> {
+    // Import decode and WAV conversion may run for seconds on large files.
+    // Keep that blocking work off the async command executor.
+    tauri::async_runtime::spawn_blocking(move || import_files_blocking(app, request))
+        .await
+        .map_err(import_task_failed)?
+}
+
+fn import_files_blocking(
+    app: tauri::AppHandle,
     request: ImportFilesRequest,
 ) -> Result<Vec<ImportFileResult>, AppError> {
     let data_dir = app
@@ -264,6 +270,11 @@ pub fn import_files(
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
     let recordings_dir = data_dir.join(RECORDINGS_DIR);
+    let db = app.state::<Db>();
+    let settings_store = app.state::<SettingsStore>();
+    let tracker = app.state::<Arc<JobTracker>>();
+    let worker = app.state::<Arc<TranscribeWorkerState>>();
+    let id_generator = app.state::<ImportSessionIdGenerator>();
     let settings = settings_store.load()?;
     let available_space_bytes = match available_space_for_path(&recordings_dir) {
         Ok(bytes) => bytes,
@@ -287,6 +298,10 @@ pub fn import_files(
     };
 
     Ok(pipeline.import_files(&request))
+}
+
+fn import_task_failed(error: impl std::fmt::Display) -> AppError {
+    AppError::new(IO_ERROR, format!("import task failed: {error}"))
 }
 
 #[tauri::command]
@@ -602,6 +617,14 @@ mod tests {
 
         assert_eq!(error.code, DB_ERROR);
         assert_eq!(error.message, "transcription is not pending: session-a");
+    }
+
+    #[test]
+    fn import_task_failure_is_reported_as_io_error() {
+        let error = import_task_failed("worker panicked");
+
+        assert_eq!(error.code, IO_ERROR);
+        assert_eq!(error.message, "import task failed: worker panicked");
     }
 
     #[test]
