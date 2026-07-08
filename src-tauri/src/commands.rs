@@ -1,10 +1,15 @@
 use serde::Serialize;
+use std::sync::Arc;
 use tauri::Manager;
 
 use crate::audio::devices::{self, AudioDevices};
-use crate::bootstrap::MODELS_DIR;
+use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
 use crate::db::{Db, Session};
 use crate::error::{AppError, DB_ERROR, IO_ERROR};
+use crate::import::{
+    available_space_for_path, ImportFileResult, ImportFilesRequest, ImportPipeline,
+    ImportSessionIdGenerator,
+};
 use crate::recording::{
     RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
 };
@@ -13,6 +18,8 @@ use crate::sound_check::{
     SoundCheckManager, SoundCheckRequest, SoundCheckResult, TauriSoundCheckEventSink,
 };
 use crate::transcription::context::{ActiveBackend, WhisperContextManager};
+use crate::transcription::jobs::JobTracker;
+use crate::transcription::worker::TranscribeWorkerState;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +37,7 @@ pub struct SystemInfo {
 pub fn get_system_info(
     app: tauri::AppHandle,
     settings_store: tauri::State<'_, SettingsStore>,
-    whisper_context: tauri::State<'_, WhisperContextManager>,
+    whisper_context: tauri::State<'_, Arc<WhisperContextManager>>,
 ) -> Result<SystemInfo, AppError> {
     let data_dir = app
         .path()
@@ -134,6 +141,46 @@ pub fn run_sound_check(
         request,
         &TauriSoundCheckEventSink::new(app),
     )
+}
+
+#[tauri::command]
+pub fn import_files(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Db>,
+    settings_store: tauri::State<'_, SettingsStore>,
+    tracker: tauri::State<'_, Arc<JobTracker>>,
+    worker: tauri::State<'_, TranscribeWorkerState>,
+    id_generator: tauri::State<'_, ImportSessionIdGenerator>,
+    request: ImportFilesRequest,
+) -> Result<Vec<ImportFileResult>, AppError> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
+    let recordings_dir = data_dir.join(RECORDINGS_DIR);
+    let settings = settings_store.load()?;
+    let available_space_bytes = match available_space_for_path(&recordings_dir) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok(request
+                .paths
+                .into_iter()
+                .map(|path| ImportFileResult::failed(path, &error))
+                .collect());
+        }
+    };
+    let next_id = || id_generator.next_id();
+    let pipeline = ImportPipeline {
+        db: &db,
+        data_dir: &data_dir,
+        tracker: tracker.as_ref(),
+        enqueuer: &*worker,
+        vad_threshold_db: settings.vad_threshold_db,
+        available_space_bytes,
+        session_id_generator: &next_id,
+    };
+
+    Ok(pipeline.import_files(&request))
 }
 
 #[tauri::command]

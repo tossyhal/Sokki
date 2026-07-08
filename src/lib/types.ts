@@ -108,3 +108,18 @@ export interface SoundCheckLevelEvent {
   mic: number;
   system: number;
 }
+
+export interface ImportFilesRequest {
+  paths: string[];
+  language: Language;
+  model: string;
+  forceUnknownDuration?: boolean | null;
+}
+
+export interface ImportFileResult {
+  path: string;
+  ok: boolean;
+  sessionId: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}

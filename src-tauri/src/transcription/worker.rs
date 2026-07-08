@@ -1,15 +1,51 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
+use serde::Serialize;
+use tauri::Emitter;
 
 use crate::db::{Db, NewSegment, SessionStatus};
 use crate::error::{AppError, DB_ERROR};
 use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub const IMPORT_PROGRESS_EVENT: &str = "import://progress";
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgressPayload {
+    pub session_id: String,
+    pub progress: f64,
+}
+
+pub trait TranscriptionEventSink: Send + Sync + 'static {
+    fn emit_import_progress(&self, payload: ImportProgressPayload);
+}
+
+pub struct NoopTranscriptionEventSink;
+
+impl TranscriptionEventSink for NoopTranscriptionEventSink {
+    fn emit_import_progress(&self, _payload: ImportProgressPayload) {}
+}
+
+pub struct TauriTranscriptionEventSink {
+    app: tauri::AppHandle,
+}
+
+impl TauriTranscriptionEventSink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl TranscriptionEventSink for TauriTranscriptionEventSink {
+    fn emit_import_progress(&self, payload: ImportProgressPayload) {
+        let _ = self.app.emit(IMPORT_PROGRESS_EVENT, payload);
+    }
+}
 
 #[derive(Debug)]
 pub enum JobProcessResult {
@@ -50,12 +86,32 @@ pub struct TranscribeWorkerHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+pub struct TranscribeWorkerState {
+    handle: Mutex<TranscribeWorkerHandle>,
+}
+
+impl TranscribeWorkerState {
+    pub fn new(handle: TranscribeWorkerHandle) -> Self {
+        Self {
+            handle: Mutex::new(handle),
+        }
+    }
+
+    pub fn enqueue_batch(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.handle
+            .lock()
+            .expect("transcription worker mutex should not be poisoned")
+            .enqueue_batch(job)
+    }
+}
+
 impl TranscribeWorkerHandle {
     pub fn start(
         db: Arc<Db>,
         tracker: Arc<JobTracker>,
         recording_active: Arc<AtomicBool>,
         processor: Arc<dyn JobProcessor>,
+        events: Arc<dyn TranscriptionEventSink>,
     ) -> Self {
         let (rt_tx, rt_rx) = unbounded();
         let (batch_tx, batch_rx) = unbounded();
@@ -68,6 +124,7 @@ impl TranscribeWorkerHandle {
             tracker,
             recording_active,
             processor,
+            events,
         });
 
         Self {
@@ -115,6 +172,7 @@ struct WorkerRuntime {
     tracker: Arc<JobTracker>,
     recording_active: Arc<AtomicBool>,
     processor: Arc<dyn JobProcessor>,
+    events: Arc<dyn TranscriptionEventSink>,
 }
 
 fn spawn_worker_loop(runtime: WorkerRuntime) -> JoinHandle<()> {
@@ -206,7 +264,8 @@ fn process_or_finish(
     let result = runtime.processor.process(&job, &should_abort);
     match result {
         Ok(JobProcessResult::Completed { segments }) => {
-            if insert_segments(&runtime.db, segments).is_err() {
+            let persisted = insert_segments(&runtime.db, segments).is_ok();
+            if !persisted {
                 let _ = runtime.db.update_session_status(
                     &job.session_id,
                     SessionStatus::Error,
@@ -218,6 +277,9 @@ fn process_or_finish(
                 &job.session_id,
                 runtime.recording_active.load(Ordering::SeqCst),
             );
+            if persisted {
+                emit_import_progress(&runtime.events, &job);
+            }
         }
         Ok(JobProcessResult::Aborted) => {
             *deferred = Some(job);
@@ -237,6 +299,21 @@ fn process_or_finish(
     }
 }
 
+fn emit_import_progress(events: &Arc<dyn TranscriptionEventSink>, job: &TranscribeJob) {
+    if job.kind != JobKind::Batch {
+        return;
+    }
+    if job.session_duration_ms == 0 {
+        return;
+    }
+
+    let progress = (job.valid_end_ms as f64 / job.session_duration_ms as f64).clamp(0.0, 1.0);
+    events.emit_import_progress(ImportProgressPayload {
+        session_id: job.session_id.clone(),
+        progress,
+    });
+}
+
 fn insert_segments(db: &Db, segments: Vec<NewSegment>) -> Result<(), AppError> {
     for segment in segments {
         db.insert_segment(&segment)
@@ -251,6 +328,7 @@ mod tests {
     use crate::db::{Language, Session, Source};
     use crate::transcription::jobs::JobKind;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
     type ProcessedMessage = (String, JobKind);
     type ProcessedSender = Sender<ProcessedMessage>;
@@ -279,6 +357,7 @@ mod tests {
             tracker: Arc::clone(&fixture.tracker),
             recording_active: Arc::clone(&fixture.recording_active),
             processor: processor.clone(),
+            events: noop_events(),
         });
 
         assert_eq!(
@@ -304,6 +383,7 @@ mod tests {
             Arc::clone(&fixture.tracker),
             Arc::clone(&fixture.recording_active),
             processor.clone(),
+            noop_events(),
         );
 
         worker
@@ -339,6 +419,7 @@ mod tests {
             Arc::clone(&fixture.tracker),
             Arc::clone(&fixture.recording_active),
             processor,
+            noop_events(),
         );
 
         worker
@@ -378,6 +459,7 @@ mod tests {
             Arc::clone(&fixture.tracker),
             Arc::clone(&fixture.recording_active),
             processor,
+            noop_events(),
         );
         let job = fixture.job("batch-session", JobKind::Batch);
         let canceled = Arc::clone(&job.canceled);
@@ -407,6 +489,7 @@ mod tests {
             Arc::clone(&fixture.tracker),
             Arc::clone(&fixture.recording_active),
             processor.clone(),
+            noop_events(),
         );
         let job = fixture.job("rt-session", JobKind::Rt);
         job.canceled.store(true, Ordering::SeqCst);
@@ -420,6 +503,40 @@ mod tests {
             "canceled rt job should not be processed"
         );
         eventually_done(&fixture, "rt-session");
+        worker.shutdown();
+    }
+
+    #[test]
+    fn completed_batch_job_emits_import_progress_from_valid_range() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("batch-session");
+        let processor = Arc::new(RecordingProcessor::default());
+        let events = Arc::new(RecordingEventSink::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor.clone(),
+            events.clone(),
+        );
+        let mut job = fixture.job("batch-session", JobKind::Batch);
+        job.valid_end_ms = 10;
+        job.session_duration_ms = 20;
+
+        worker.enqueue_batch(job).unwrap();
+
+        assert_eq!(
+            processor.recv_processed(),
+            ("batch-session".to_string(), JobKind::Batch)
+        );
+        eventually_done(&fixture, "batch-session");
+        assert_eq!(
+            events.payloads.lock().unwrap().as_slice(),
+            &[ImportProgressPayload {
+                session_id: "batch-session".to_string(),
+                progress: 0.5,
+            }]
+        );
         worker.shutdown();
     }
 
@@ -496,6 +613,21 @@ mod tests {
         unbounded()
     }
 
+    #[derive(Default)]
+    struct RecordingEventSink {
+        payloads: Mutex<Vec<ImportProgressPayload>>,
+    }
+
+    impl TranscriptionEventSink for RecordingEventSink {
+        fn emit_import_progress(&self, payload: ImportProgressPayload) {
+            self.payloads.lock().unwrap().push(payload);
+        }
+    }
+
+    fn noop_events() -> Arc<dyn TranscriptionEventSink> {
+        Arc::new(NoopTranscriptionEventSink)
+    }
+
     struct WorkerFixture {
         db: Arc<Db>,
         tracker: Arc<JobTracker>,
@@ -538,6 +670,7 @@ mod tests {
                 chunk_start_ms: 0,
                 valid_start_ms: 0,
                 valid_end_ms: 10,
+                session_duration_ms: 10,
                 language: Language::Ja,
                 model: "medium-q5_0".to_string(),
                 canceled,

@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AudioDevices,
+  ImportFileResult,
+  ImportFilesRequest,
   RecordingState,
   Session,
   Settings,
@@ -48,6 +50,10 @@ export function getRecordingState(): Promise<RecordingState> {
 
 export function runSoundCheck(request: SoundCheckRequest): Promise<SoundCheckResult> {
   return invoke<SoundCheckResult>("run_sound_check", { request });
+}
+
+export function importFiles(request: ImportFilesRequest): Promise<ImportFileResult[]> {
+  return invoke<ImportFileResult[]>("import_files", { request });
 }
 
 export function getSessions(): Promise<Session[]> {

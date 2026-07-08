@@ -1,7 +1,10 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use symphonia::core::codecs::CODEC_TYPE_NULL;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -9,9 +12,16 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use crate::audio::decode::decode_audio_file;
+use crate::audio::wav::StreamingWavWriter;
+use crate::bootstrap::RECORDINGS_DIR;
+use crate::db::{Db, Language, Session, SessionStatus, Source};
 use crate::error::{
-    AppError, AUDIO_TOO_LONG, DECODE_FAILED, DISK_FULL, DURATION_UNKNOWN, FILE_TOO_LARGE, IO_ERROR,
+    AppError, AUDIO_TOO_LONG, DB_ERROR, DECODE_FAILED, DISK_FULL, DURATION_UNKNOWN, FILE_TOO_LARGE,
+    IO_ERROR,
 };
+use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+use crate::transcription::worker::{TranscribeWorkerHandle, TranscribeWorkerState};
 
 const MAX_IMPORT_FILE_SIZE_BYTES: u64 = 2_000_000_000;
 const MAX_IMPORT_DURATION_MS: u64 = 3 * 60 * 60 * 1_000;
@@ -45,6 +55,167 @@ pub struct BatchAudioChunk {
     pub valid_end_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFilesRequest {
+    pub paths: Vec<String>,
+    pub language: Language,
+    pub model: String,
+    pub force_unknown_duration: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFileResult {
+    pub path: String,
+    pub ok: bool,
+    pub session_id: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl ImportFileResult {
+    pub fn failed(path: String, error: &AppError) -> Self {
+        Self {
+            path,
+            ok: false,
+            session_id: None,
+            error_code: Some(error.code.clone()),
+            error_message: Some(error.message.clone()),
+        }
+    }
+}
+
+pub trait BatchJobEnqueuer {
+    fn enqueue_batch_job(&self, job: TranscribeJob) -> Result<(), AppError>;
+}
+
+impl BatchJobEnqueuer for TranscribeWorkerHandle {
+    fn enqueue_batch_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_batch(job)
+    }
+}
+
+impl BatchJobEnqueuer for TranscribeWorkerState {
+    fn enqueue_batch_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_batch(job)
+    }
+}
+
+#[derive(Default)]
+pub struct ImportSessionIdGenerator {
+    counter: AtomicU64,
+}
+
+impl ImportSessionIdGenerator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn next_id(&self) -> String {
+        let sequence = self.counter.fetch_add(1, Ordering::SeqCst);
+        format!("import-{}-{sequence}", unix_time_ms())
+    }
+}
+
+pub struct ImportPipeline<'a> {
+    pub db: &'a Db,
+    pub data_dir: &'a Path,
+    pub tracker: &'a JobTracker,
+    pub enqueuer: &'a dyn BatchJobEnqueuer,
+    pub vad_threshold_db: i32,
+    pub available_space_bytes: u64,
+    pub session_id_generator: &'a dyn Fn() -> String,
+}
+
+impl<'a> ImportPipeline<'a> {
+    pub fn import_files(&self, request: &ImportFilesRequest) -> Vec<ImportFileResult> {
+        request
+            .paths
+            .iter()
+            .map(|path| self.import_one(path, request))
+            .collect()
+    }
+
+    fn import_one(&self, path: &str, request: &ImportFilesRequest) -> ImportFileResult {
+        match self.import_one_inner(path, request) {
+            Ok(session_id) => ImportFileResult {
+                path: path.to_string(),
+                ok: true,
+                session_id: Some(session_id),
+                error_code: None,
+                error_message: None,
+            },
+            Err(error) => ImportFileResult::failed(path.to_string(), &error),
+        }
+    }
+
+    fn import_one_inner(
+        &self,
+        path: &str,
+        request: &ImportFilesRequest,
+    ) -> Result<String, AppError> {
+        let path_buf = PathBuf::from(path);
+        validate_import_file(
+            &path_buf,
+            request.force_unknown_duration.unwrap_or(false),
+            self.available_space_bytes,
+        )?;
+        let decoded = decode_audio_file(&path_buf)?;
+        if decoded.duration_ms > MAX_IMPORT_DURATION_MS {
+            return Err(AppError::new(
+                AUDIO_TOO_LONG,
+                "import audio is longer than 3 hours",
+            ));
+        }
+
+        let session_id = (self.session_id_generator)();
+        let wav_path = self
+            .data_dir
+            .join(RECORDINGS_DIR)
+            .join(format!("{session_id}.wav"));
+        write_import_wav(&wav_path, &decoded.samples)?;
+        let chunks =
+            split_batch_audio_chunks(&decoded.samples, decoded.sample_rate, self.vad_threshold_db);
+        let session = import_session(
+            &session_id,
+            &path_buf,
+            &wav_path,
+            decoded.duration_ms,
+            request,
+            !chunks.is_empty(),
+        );
+        self.db.insert_session(&session).map_err(db_error)?;
+
+        for chunk in chunks {
+            let canceled = self.tracker.enqueue(&session_id);
+            let job = TranscribeJob {
+                session_id: session_id.clone(),
+                kind: JobKind::Batch,
+                audio: chunk.audio,
+                chunk_start_ms: chunk.chunk_start_ms,
+                valid_start_ms: chunk.valid_start_ms,
+                valid_end_ms: chunk.valid_end_ms,
+                session_duration_ms: decoded.duration_ms,
+                language: request.language,
+                model: request.model.clone(),
+                canceled,
+            };
+            if let Err(error) = self.enqueuer.enqueue_batch_job(job) {
+                let _ = self.db.update_session_status(
+                    &session_id,
+                    SessionStatus::Error,
+                    Some(&error.message),
+                );
+                let _ = self.tracker.finish(self.db, &session_id, false);
+                return Err(error);
+            }
+        }
+
+        Ok(session_id)
+    }
+}
+
 pub fn validate_import_file(
     path: impl AsRef<Path>,
     force_unknown_duration: bool,
@@ -60,6 +231,17 @@ pub fn validate_import_file(
         force_unknown_duration,
         available_space_bytes,
     })
+}
+
+pub fn available_space_for_path(path: impl AsRef<Path>) -> Result<u64, AppError> {
+    let path = path.as_ref();
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disk = disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .ok_or_else(|| AppError::new(DISK_FULL, "failed to determine available disk space"))?;
+    Ok(disk.available_space())
 }
 
 pub fn validate_import_limits(
@@ -299,6 +481,50 @@ fn sample_index_to_ms(sample_index: usize, sample_rate: u32) -> u64 {
     sample_index as u64 * 1_000 / sample_rate as u64
 }
 
+fn import_session(
+    session_id: &str,
+    source_path: &Path,
+    wav_path: &Path,
+    duration_ms: u64,
+    request: &ImportFilesRequest,
+    has_jobs: bool,
+) -> Session {
+    Session {
+        id: session_id.to_string(),
+        title: source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(session_id)
+            .to_string(),
+        created_at: unix_time_ms() as i64,
+        duration_ms: duration_ms as i64,
+        audio_path: Some(wav_path.display().to_string()),
+        source: Source::Import,
+        language: request.language,
+        model: request.model.clone(),
+        status: if has_jobs {
+            SessionStatus::Transcribing
+        } else {
+            SessionStatus::Done
+        },
+        error_message: None,
+        drop_count: 0,
+    }
+}
+
+fn write_import_wav(path: &Path, samples: &[f32]) -> Result<u64, AppError> {
+    let mut writer = StreamingWavWriter::create(path)?;
+    writer.write_frame(samples)?;
+    writer.finalize()
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn decode_error(error: SymphoniaError) -> AppError {
     AppError::new(DECODE_FAILED, format!("failed to probe audio: {error}"))
 }
@@ -307,10 +533,17 @@ fn io_error(error: io::Error) -> AppError {
     AppError::new(IO_ERROR, format!("io error: {error}"))
 }
 
+fn db_error(error: rusqlite::Error) -> AppError {
+    AppError::new(DB_ERROR, format!("database error: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SessionStatus;
+    use crate::error::DB_ERROR;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     #[test]
     fn rejects_unsupported_extension_before_other_limits() {
@@ -452,6 +685,100 @@ mod tests {
         assert_chunk(&chunks[1], 14_000, 15_000, 22_000, 8_000);
     }
 
+    #[test]
+    fn import_pipeline_returns_per_file_results_and_enqueues_batch_jobs() {
+        let data_dir = temp_dir("pipeline-success");
+        let source_path = data_dir.join("source.wav");
+        write_mono_wav(&source_path, 16_000, 31_000);
+        let db = Db::open_in_memory().unwrap();
+        let tracker = JobTracker::new();
+        let enqueuer = RecordingEnqueuer::default();
+        let next_id = || "import-session-a".to_string();
+        let pipeline = ImportPipeline {
+            db: &db,
+            data_dir: &data_dir,
+            tracker: &tracker,
+            enqueuer: &enqueuer,
+            vad_threshold_db: -40,
+            available_space_bytes: 10 * 1024 * 1024 * 1024,
+            session_id_generator: &next_id,
+        };
+        let request = ImportFilesRequest {
+            paths: vec![
+                source_path.display().to_string(),
+                data_dir.join("bad.webm").display().to_string(),
+            ],
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            force_unknown_duration: None,
+        };
+
+        let results = pipeline.import_files(&request);
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].ok);
+        assert_eq!(results[0].session_id.as_deref(), Some("import-session-a"));
+        assert!(!results[1].ok);
+        assert_eq!(results[1].error_code.as_deref(), Some(DECODE_FAILED));
+
+        let session = db
+            .get_session("import-session-a")
+            .unwrap()
+            .expect("session should exist");
+        assert_eq!(session.title, "source.wav");
+        assert_eq!(session.source, Source::Import);
+        assert_eq!(session.status, SessionStatus::Transcribing);
+        assert_eq!(session.duration_ms, 31_000);
+        assert!(Path::new(session.audio_path.as_ref().unwrap()).is_file());
+
+        let jobs = enqueuer.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(tracker.pending_count("import-session-a"), 3);
+        assert_eq!(jobs[0].valid_start_ms, 0);
+        assert_eq!(jobs[0].valid_end_ms, 15_000);
+        assert_eq!(jobs[1].chunk_start_ms, 14_000);
+        assert_eq!(jobs[1].valid_start_ms, 15_000);
+        assert_eq!(jobs[1].valid_end_ms, 30_000);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn import_pipeline_marks_file_failed_when_enqueue_fails() {
+        let data_dir = temp_dir("pipeline-enqueue-failure");
+        let source_path = data_dir.join("source.wav");
+        write_mono_wav(&source_path, 16_000, 1_000);
+        let db = Db::open_in_memory().unwrap();
+        let tracker = JobTracker::new();
+        let enqueuer = FailingEnqueuer;
+        let next_id = || "import-session-b".to_string();
+        let pipeline = ImportPipeline {
+            db: &db,
+            data_dir: &data_dir,
+            tracker: &tracker,
+            enqueuer: &enqueuer,
+            vad_threshold_db: -40,
+            available_space_bytes: 10 * 1024 * 1024 * 1024,
+            session_id_generator: &next_id,
+        };
+        let request = ImportFilesRequest {
+            paths: vec![source_path.display().to_string()],
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            force_unknown_duration: None,
+        };
+
+        let results = pipeline.import_files(&request);
+
+        assert!(!results[0].ok);
+        assert_eq!(results[0].error_code.as_deref(), Some(DB_ERROR));
+        assert_eq!(tracker.pending_count("import-session-b"), 0);
+        assert_eq!(
+            db.get_session("import-session-b").unwrap().unwrap().status,
+            SessionStatus::Error
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
     fn input(name: &str) -> ImportValidationInput<'_> {
         ImportValidationInput {
             path: Path::new(name),
@@ -464,6 +791,12 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sokki-import-{name}"))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("sokki-import-{name}-{}", unix_time_ms()));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 
     fn write_mono_wav(path: &Path, sample_rate: u32, duration_ms: u32) {
@@ -509,5 +842,25 @@ mod tests {
             sample_index_to_ms(chunk.audio.len(), 16_000),
             audio_duration_ms
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingEnqueuer {
+        jobs: Mutex<Vec<TranscribeJob>>,
+    }
+
+    impl BatchJobEnqueuer for RecordingEnqueuer {
+        fn enqueue_batch_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+    }
+
+    struct FailingEnqueuer;
+
+    impl BatchJobEnqueuer for FailingEnqueuer {
+        fn enqueue_batch_job(&self, _job: TranscribeJob) -> Result<(), AppError> {
+            Err(AppError::new(DB_ERROR, "worker stopped"))
+        }
     }
 }

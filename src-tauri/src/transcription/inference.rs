@@ -550,6 +550,7 @@ mod tests {
             chunk_start_ms: 0,
             valid_start_ms: 0,
             valid_end_ms: 100,
+            session_duration_ms: 100,
             language,
             model: "medium-q5_0".to_string(),
             canceled: Arc::new(AtomicBool::new(false)),
