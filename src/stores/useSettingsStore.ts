@@ -40,6 +40,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     try {
       const settings = await updateSettings(patch);
       set({ settings, saving: false });
+      try {
+        const systemInfo = await getSystemInfo();
+        set({ systemInfo });
+      } catch (error) {
+        set({ error: errorMessage(error) });
+      }
     } catch (error) {
       if (current) {
         set({ settings: current });

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useSettingsStore } from "../stores/useSettingsStore";
-import type { GpuMode, Language } from "../lib/types";
+import type { GpuMode, Language, SystemInfo } from "../lib/types";
 
 const languageOptions: Array<{ value: Language; label: string }> = [
   { value: "ja", label: "日本語" },
@@ -74,11 +74,10 @@ export default function Settings() {
               options={languageOptions}
               onChange={(language) => void update({ language: language as Language })}
             />
-            <SelectRow
-              label="GPUモード"
+            <GpuModeRow
               value={settings.gpuMode}
-              options={gpuModeOptions}
-              onChange={(gpuMode) => void update({ gpuMode: gpuMode as GpuMode })}
+              systemInfo={systemInfo}
+              onChange={(gpuMode) => void update({ gpuMode })}
             />
             <RangeRow
               label="マイクゲイン"
@@ -118,11 +117,9 @@ export default function Settings() {
         <h2 className="text-title">情報</h2>
         <div className="mt-4 grid gap-3 text-body">
           <InfoRow label="アプリバージョン" value={systemInfo?.appVersion ?? "-"} />
-          <InfoRow
-            label="GPU対応"
-            value={systemInfo?.compiledGpuSupport ? "有効" : "CPU版"}
-          />
-          <InfoRow label="使用中バックエンド" value={systemInfo?.activeBackend ?? "-"} />
+          <InfoRow label="GPU対応" value={gpuSupportLabel(systemInfo?.compiledGpuSupport)} />
+          <InfoRow label="要求バックエンド" value={gpuModeLabel(systemInfo?.requestedBackend)} />
+          <InfoRow label="使用中バックエンド" value={backendLabel(systemInfo)} />
           <InfoRow label="データ保存先" value={systemInfo?.dataDir ?? "-"} />
           <InfoRow label="モデル保存先" value={systemInfo?.modelsDir ?? "-"} />
         </div>
@@ -135,11 +132,13 @@ function SelectRow<T extends string>({
   label,
   value,
   options,
+  disabledValues,
   onChange,
 }: {
   label: string;
   value: T;
   options: Array<{ value: T; label: string }>;
+  disabledValues?: readonly T[];
   onChange: (value: T) => void;
 }) {
   return (
@@ -151,12 +150,53 @@ function SelectRow<T extends string>({
         className="h-10 rounded-btn border border-line-strong bg-surface px-3 text-body text-ink outline-none hover:bg-surface-2 focus:border-ink-2"
       >
         {options.map((option) => (
-          <option key={option.value} value={option.value}>
+          <option
+            key={option.value}
+            value={option.value}
+            disabled={disabledValues?.includes(option.value)}
+          >
             {option.label}
           </option>
         ))}
       </select>
     </label>
+  );
+}
+
+function GpuModeRow({
+  value,
+  systemInfo,
+  onChange,
+}: {
+  value: GpuMode;
+  systemInfo: SystemInfo | null;
+  onChange: (value: GpuMode) => void;
+}) {
+  const gpuOptionsDisabled = systemInfo?.compiledGpuSupport === false;
+  const disabledValues = gpuOptionsDisabled
+    ? (["auto", "force_gpu"] as const satisfies readonly GpuMode[])
+    : undefined;
+
+  return (
+    <div className="grid gap-2">
+      <SelectRow
+        label="GPUモード"
+        value={value}
+        options={gpuModeOptions}
+        disabledValues={disabledValues}
+        onChange={onChange}
+      />
+      {gpuOptionsDisabled ? (
+        <p className="ml-[196px] text-meta text-ink-2">
+          CPU版ビルドです。GPUを使う自動判別とGPU固定は選択できません。
+        </p>
+      ) : null}
+      {systemInfo?.gpuErrorMessage ? (
+        <p className="ml-[196px] text-meta text-ink-2">
+          GPU初期化失敗: {systemInfo.gpuErrorMessage}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -225,4 +265,42 @@ function InfoRow({ label, value }: { label: string; value: string }) {
       <div className="min-w-0 break-all text-ink">{value}</div>
     </div>
   );
+}
+
+function gpuSupportLabel(compiledGpuSupport: boolean | undefined) {
+  if (compiledGpuSupport === undefined) {
+    return "-";
+  }
+  return compiledGpuSupport ? "有効" : "CPU版ビルド";
+}
+
+function gpuModeLabel(gpuMode: GpuMode | undefined) {
+  switch (gpuMode) {
+    case "auto":
+      return "自動";
+    case "force_cpu":
+      return "CPU固定";
+    case "force_gpu":
+      return "GPU固定";
+    default:
+      return "-";
+  }
+}
+
+function backendLabel(systemInfo: SystemInfo | null) {
+  if (!systemInfo) {
+    return "-";
+  }
+  switch (systemInfo.activeBackend) {
+    case "gpu":
+      return "GPU (Vulkan)";
+    case "cpu":
+      return systemInfo.gpuErrorMessage
+        ? `CPU - GPU初期化失敗: ${systemInfo.gpuErrorMessage}`
+        : "CPU";
+    case "none":
+      return "未ロード";
+    default:
+      return "-";
+  }
 }
