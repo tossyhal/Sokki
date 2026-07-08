@@ -254,10 +254,12 @@ function SoundCheckPanel({
               <span className="text-ink">時間</span> {formatDuration(result.durationMs)}
             </div>
             <div>
-              <span className="text-ink">Mic</span> {Math.round(result.peakMicDb)}dB
+              <span className="text-ink">Mic</span>{" "}
+              {result.peakMicDb === null ? "—" : `${Math.round(result.peakMicDb)}dB`}
             </div>
             <div>
-              <span className="text-ink">Sys</span> {Math.round(result.peakSystemDb)}dB
+              <span className="text-ink">Sys</span>{" "}
+              {result.peakSystemDb === null ? "—" : `${Math.round(result.peakSystemDb)}dB`}
             </div>
           </div>
           {result.warnings.length > 0 ? (

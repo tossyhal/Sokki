@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 use crate::audio::devices::{self, AudioDevice, AudioDevices};
-use crate::audio::wav::{StreamingWavWriter, WAV_SAMPLE_RATE};
+use crate::audio::mixer::{MixerSink, SourcePeaks};
+use crate::audio::pipeline::{CapturePipeline, CapturePipelineConfig};
+use crate::audio::wav::StreamingWavWriter;
 use crate::bootstrap::SOUNDCHECK_DIR;
 use crate::db::Source;
 use crate::error::{AppError, ALREADY_RECORDING, DEVICE_NOT_FOUND, IO_ERROR, SOUND_CHECK_BUSY};
@@ -15,10 +18,10 @@ use crate::recording::RecordingManager;
 
 pub const SOUND_CHECK_LEVEL_EVENT: &str = "soundcheck://level";
 const DEFAULT_DURATION_MS: u64 = 5_000;
-const LEVEL_INTERVAL_MS: u64 = 100;
+const ERROR_POLL_INTERVAL_MS: u64 = 50;
 const SILENCE_PEAK_DB: f32 = -120.0;
-const TEST_TONE_HZ: f32 = 880.0;
-const TEST_TONE_AMPLITUDE: f32 = 0.2;
+const SILENCE_WARNING_DB: f32 = -60.0;
+const CLIPPING_WARNING_DB: f32 = -1.0;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -34,8 +37,8 @@ pub struct SoundCheckRequest {
 pub struct SoundCheckResult {
     pub wav_path: String,
     pub duration_ms: u64,
-    pub peak_mic_db: f32,
-    pub peak_system_db: f32,
+    pub peak_mic_db: Option<f32>,
+    pub peak_system_db: Option<f32>,
     pub warnings: Vec<String>,
 }
 
@@ -46,7 +49,7 @@ pub struct SoundCheckLevelPayload {
     pub system: f32,
 }
 
-pub trait SoundCheckEventSink {
+pub trait SoundCheckEventSink: Send + Sync {
     fn emit_level(&self, payload: SoundCheckLevelPayload);
 }
 
@@ -63,6 +66,34 @@ struct BusyGuard<'a> {
     busy: &'a AtomicBool,
 }
 
+/// Receives mixed frames from the sound-check capture pipeline and streams
+/// them into the test WAV. The first write failure is kept and aborts the run.
+struct SoundCheckSink {
+    io: Arc<Mutex<SoundCheckIo>>,
+}
+
+struct SoundCheckIo {
+    writer: Option<StreamingWavWriter>,
+    write_error: Option<AppError>,
+}
+
+impl MixerSink for SoundCheckSink {
+    fn write_frame(&mut self, frame: &[f32]) {
+        let mut io = self
+            .io
+            .lock()
+            .expect("sound check io mutex should not be poisoned");
+        if io.write_error.is_some() {
+            return;
+        }
+        if let Some(writer) = io.writer.as_mut() {
+            if let Err(error) = writer.write_frame(frame) {
+                io.write_error = Some(error);
+            }
+        }
+    }
+}
+
 impl SoundCheckManager {
     pub fn new() -> Self {
         Self {
@@ -75,7 +106,7 @@ impl SoundCheckManager {
         recording_manager: &RecordingManager,
         data_dir: &Path,
         request: SoundCheckRequest,
-        events: &dyn SoundCheckEventSink,
+        events: Arc<dyn SoundCheckEventSink>,
     ) -> Result<SoundCheckResult, AppError> {
         if recording_manager.recording_active() {
             return Err(AppError::new(
@@ -84,47 +115,15 @@ impl SoundCheckManager {
             ));
         }
         let _guard = self.enter_busy()?;
-        let audio_devices = devices::list_audio_devices()?;
-        self.run_with_devices(data_dir, request, &audio_devices, events)
-    }
-
-    fn run_with_devices(
-        &self,
-        data_dir: &Path,
-        request: SoundCheckRequest,
-        audio_devices: &AudioDevices,
-        events: &dyn SoundCheckEventSink,
-    ) -> Result<SoundCheckResult, AppError> {
         if request.source == Source::Import {
             return Err(AppError::new(
                 IO_ERROR,
                 "import source cannot be used for sound check",
             ));
         }
-        validate_requested_devices(&request, audio_devices)?;
-
-        let duration_ms = request.duration_ms.unwrap_or(DEFAULT_DURATION_MS);
-        let wav_path = sound_check_wav_path(data_dir);
-        let mut writer = StreamingWavWriter::create(&wav_path)?;
-        let frame = sound_check_test_tone_frame();
-        let ticks = duration_ms.div_ceil(LEVEL_INTERVAL_MS).max(1);
-        let levels = level_payload_for_source(request.source);
-
-        for _ in 0..ticks {
-            writer.write_frame(&frame)?;
-            events.emit_level(levels);
-            thread::sleep(Duration::from_millis(LEVEL_INTERVAL_MS));
-        }
-
-        let actual_duration_ms = writer.finalize()?;
-        let result = SoundCheckResult {
-            wav_path: wav_path.display().to_string(),
-            duration_ms: actual_duration_ms,
-            peak_mic_db: peak_for_source(request.source, Source::Mic),
-            peak_system_db: peak_for_source(request.source, Source::System),
-            warnings: warnings_for_source(request.source),
-        };
-        Ok(result)
+        let audio_devices = devices::list_audio_devices()?;
+        validate_requested_devices(&request, &audio_devices)?;
+        capture_sound_check(data_dir, request, events)
     }
 
     fn enter_busy(&self) -> Result<BusyGuard<'_>, AppError> {
@@ -135,6 +134,152 @@ impl SoundCheckManager {
             ));
         }
         Ok(BusyGuard { busy: &self.busy })
+    }
+}
+
+fn capture_sound_check(
+    data_dir: &Path,
+    request: SoundCheckRequest,
+    events: Arc<dyn SoundCheckEventSink>,
+) -> Result<SoundCheckResult, AppError> {
+    let duration_ms = request.duration_ms.unwrap_or(DEFAULT_DURATION_MS);
+    let wav_path = sound_check_wav_path(data_dir);
+    let writer = StreamingWavWriter::create(&wav_path)?;
+
+    let io = Arc::new(Mutex::new(SoundCheckIo {
+        writer: Some(writer),
+        write_error: None,
+    }));
+    let peaks = Arc::new(Mutex::new(SourcePeaks::default()));
+    let capture_error: Arc<Mutex<Option<AppError>>> = Arc::new(Mutex::new(None));
+
+    let on_level = {
+        let peaks = Arc::clone(&peaks);
+        let events = Arc::clone(&events);
+        move |levels: crate::audio::mixer::SourceLevels, frame_peaks: SourcePeaks| {
+            let mut peaks = peaks
+                .lock()
+                .expect("sound check peaks mutex should not be poisoned");
+            peaks.mic = peaks.mic.max(frame_peaks.mic);
+            peaks.system = peaks.system.max(frame_peaks.system);
+            drop(peaks);
+            events.emit_level(SoundCheckLevelPayload {
+                mic: levels.mic,
+                system: levels.system,
+            });
+        }
+    };
+    let on_error = {
+        let capture_error = Arc::clone(&capture_error);
+        Arc::new(move |error: AppError| {
+            capture_error
+                .lock()
+                .expect("sound check error mutex should not be poisoned")
+                .get_or_insert(error);
+        })
+    };
+
+    let pipeline = CapturePipeline::start(
+        CapturePipelineConfig {
+            source: request.source,
+            mic_device: request.mic_device.clone(),
+            loopback_device: request.loopback_device.clone(),
+            // Measure true input peaks: no gain applied during sound check.
+            mic_gain: 1.0,
+            system_gain: 1.0,
+        },
+        Arc::new(AtomicU64::new(0)),
+        SoundCheckSink {
+            io: Arc::clone(&io),
+        },
+        on_level,
+        on_error,
+    );
+    let pipeline = match pipeline {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            let _ = std::fs::remove_file(&wav_path);
+            return Err(error);
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(duration_ms);
+    while Instant::now() < deadline {
+        if capture_error
+            .lock()
+            .expect("sound check error mutex should not be poisoned")
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(ERROR_POLL_INTERVAL_MS));
+    }
+    pipeline.stop();
+
+    let mut io = io
+        .lock()
+        .expect("sound check io mutex should not be poisoned");
+    let failure = capture_error
+        .lock()
+        .expect("sound check error mutex should not be poisoned")
+        .take()
+        .or_else(|| io.write_error.take());
+    if let Some(error) = failure {
+        drop(io);
+        let _ = std::fs::remove_file(&wav_path);
+        return Err(error);
+    }
+
+    let actual_duration_ms = io
+        .writer
+        .take()
+        .ok_or_else(|| AppError::new(IO_ERROR, "sound check wav writer is already closed"))?
+        .finalize()?;
+    drop(io);
+
+    let peaks = *peaks
+        .lock()
+        .expect("sound check peaks mutex should not be poisoned");
+    let (peak_mic_db, peak_system_db, warnings) = analyze_peaks(request.source, peaks);
+
+    Ok(SoundCheckResult {
+        wav_path: wav_path.display().to_string(),
+        duration_ms: actual_duration_ms,
+        peak_mic_db,
+        peak_system_db,
+        warnings,
+    })
+}
+
+/// Converts per-source sample peaks into dBFS values for the sources the
+/// request captured, plus the spec §5.7 warnings (near-silent / clipping).
+fn analyze_peaks(source: Source, peaks: SourcePeaks) -> (Option<f32>, Option<f32>, Vec<String>) {
+    let mic_db = matches!(source, Source::Mic | Source::Mix).then(|| peak_db(peaks.mic));
+    let system_db = matches!(source, Source::System | Source::Mix).then(|| peak_db(peaks.system));
+
+    let mut warnings = Vec::new();
+    if let Some(db) = mic_db {
+        if db < SILENCE_WARNING_DB {
+            warnings.push("マイクがほぼ無音です".to_string());
+        } else if db > CLIPPING_WARNING_DB {
+            warnings.push("マイク入力が大きすぎます".to_string());
+        }
+    }
+    if let Some(db) = system_db {
+        if db < SILENCE_WARNING_DB {
+            warnings.push("システム音声がほぼ無音です".to_string());
+        } else if db > CLIPPING_WARNING_DB {
+            warnings.push("システム音声が大きすぎます".to_string());
+        }
+    }
+    (mic_db, system_db, warnings)
+}
+
+fn peak_db(peak: f32) -> f32 {
+    if peak <= 0.0 {
+        SILENCE_PEAK_DB
+    } else {
+        (20.0 * peak.log10()).max(SILENCE_PEAK_DB)
     }
 }
 
@@ -229,119 +374,21 @@ fn timestamp_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn samples_per_level_tick() -> usize {
-    (WAV_SAMPLE_RATE as u64 * LEVEL_INTERVAL_MS / 1_000) as usize
-}
-
-fn sound_check_test_tone_frame() -> Vec<f32> {
-    let sample_count = samples_per_level_tick();
-    let sample_rate = WAV_SAMPLE_RATE as f32;
-    (0..sample_count)
-        .map(|sample_index| {
-            let phase =
-                2.0 * std::f32::consts::PI * TEST_TONE_HZ * sample_index as f32 / sample_rate;
-            phase.sin() * TEST_TONE_AMPLITUDE
-        })
-        .collect()
-}
-
-fn level_payload_for_source(source: Source) -> SoundCheckLevelPayload {
-    match source {
-        Source::Mic => SoundCheckLevelPayload {
-            mic: 0.0,
-            system: 0.0,
-        },
-        Source::System => SoundCheckLevelPayload {
-            mic: 0.0,
-            system: 0.0,
-        },
-        Source::Mix => SoundCheckLevelPayload {
-            mic: 0.0,
-            system: 0.0,
-        },
-        Source::Import => SoundCheckLevelPayload {
-            mic: 0.0,
-            system: 0.0,
-        },
-    }
-}
-
-fn peak_for_source(source: Source, target: Source) -> f32 {
-    match (source, target) {
-        (Source::Mic, Source::Mic)
-        | (Source::System, Source::System)
-        | (Source::Mix, Source::Mic)
-        | (Source::Mix, Source::System) => SILENCE_PEAK_DB,
-        _ => SILENCE_PEAK_DB,
-    }
-}
-
-fn warnings_for_source(source: Source) -> Vec<String> {
-    match source {
-        Source::Mic => vec!["マイクがほぼ無音です".to_string()],
-        Source::System => vec!["システム音声がほぼ無音です".to_string()],
-        Source::Mix => vec![
-            "マイクがほぼ無音です".to_string(),
-            "システム音声がほぼ無音です".to_string(),
-        ],
-        Source::Import => vec![],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::devices::{AudioDevice, AudioDevices};
-    use std::sync::Mutex;
-
-    #[test]
-    fn run_sound_check_writes_audible_wav_and_returns_absolute_path() {
-        let manager = SoundCheckManager::new();
-        let data_dir =
-            temp_data_dir("run_sound_check_writes_audible_wav_and_returns_absolute_path");
-        let events = TestSoundCheckEventSink::default();
-
-        let result = manager
-            .run_with_devices(
-                &data_dir,
-                sample_request(Source::Mic, 100),
-                &sample_devices(),
-                &events,
-            )
-            .unwrap();
-
-        assert!(Path::new(&result.wav_path).is_absolute());
-        assert_eq!(result.duration_ms, 100);
-        assert_eq!(result.peak_mic_db, SILENCE_PEAK_DB);
-        assert_eq!(events.levels.lock().unwrap().len(), 1);
-        let mut reader = hound::WavReader::open(&result.wav_path).unwrap();
-        let samples = reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            samples.iter().any(|sample| *sample != 0),
-            "sound check wav must contain audible samples for the playback gate"
-        );
-        let _ = std::fs::remove_dir_all(data_dir);
-    }
 
     #[test]
     fn rejects_missing_requested_device() {
-        let manager = SoundCheckManager::new();
-        let data_dir = temp_data_dir("sound_check_rejects_missing_requested_device");
-        let events = TestSoundCheckEventSink::default();
         let request = SoundCheckRequest {
             mic_device: Some("missing mic".to_string()),
-            ..sample_request(Source::Mic, 100)
+            ..sample_request(Source::Mic)
         };
 
-        let error = manager
-            .run_with_devices(&data_dir, request, &sample_devices(), &events)
-            .unwrap_err();
+        let error = validate_requested_devices(&request, &sample_devices()).unwrap_err();
 
         assert_eq!(error.code, DEVICE_NOT_FOUND);
-        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
@@ -354,12 +401,63 @@ mod tests {
         assert_eq!(error.code, SOUND_CHECK_BUSY);
     }
 
-    fn sample_request(source: Source, duration_ms: u64) -> SoundCheckRequest {
+    #[test]
+    fn analyze_reports_peaks_only_for_captured_sources() {
+        let peaks = SourcePeaks {
+            mic: 0.5,
+            system: 0.5,
+        };
+
+        let (mic, system, warnings) = analyze_peaks(Source::Mic, peaks);
+        assert!((mic.unwrap() - -6.02).abs() < 0.01);
+        assert_eq!(system, None);
+        assert!(warnings.is_empty());
+
+        let (mic, system, _) = analyze_peaks(Source::System, peaks);
+        assert_eq!(mic, None);
+        assert!(system.is_some());
+    }
+
+    #[test]
+    fn analyze_warns_on_silent_sources() {
+        let (mic, system, warnings) = analyze_peaks(Source::Mix, SourcePeaks::default());
+
+        assert_eq!(mic, Some(SILENCE_PEAK_DB));
+        assert_eq!(system, Some(SILENCE_PEAK_DB));
+        assert_eq!(
+            warnings,
+            vec![
+                "マイクがほぼ無音です".to_string(),
+                "システム音声がほぼ無音です".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn analyze_warns_on_clipping_sources() {
+        let peaks = SourcePeaks {
+            mic: 1.0,
+            system: 0.999,
+        };
+
+        let (mic, _, warnings) = analyze_peaks(Source::Mix, peaks);
+
+        assert_eq!(mic, Some(0.0));
+        assert_eq!(
+            warnings,
+            vec![
+                "マイク入力が大きすぎます".to_string(),
+                "システム音声が大きすぎます".to_string(),
+            ]
+        );
+    }
+
+    fn sample_request(source: Source) -> SoundCheckRequest {
         SoundCheckRequest {
             source,
             mic_device: None,
             loopback_device: None,
-            duration_ms: Some(duration_ms),
+            duration_ms: Some(100),
         }
     }
 
@@ -375,24 +473,6 @@ mod tests {
                 name: "Speakers".to_string(),
                 is_default: true,
             }],
-        }
-    }
-
-    fn temp_data_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("sokki-sound-check-{name}"));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    #[derive(Default)]
-    struct TestSoundCheckEventSink {
-        levels: Mutex<Vec<SoundCheckLevelPayload>>,
-    }
-
-    impl SoundCheckEventSink for TestSoundCheckEventSink {
-        fn emit_level(&self, payload: SoundCheckLevelPayload) {
-            self.levels.lock().unwrap().push(payload);
         }
     }
 }

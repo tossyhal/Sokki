@@ -115,8 +115,8 @@ export interface SoundCheckRequest {
 export interface SoundCheckResult {
   wavPath: string;
   durationMs: number;
-  peakMicDb: number;
-  peakSystemDb: number;
+  peakMicDb: number | null;
+  peakSystemDb: number | null;
   warnings: string[];
 }
 

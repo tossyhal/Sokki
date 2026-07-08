@@ -229,22 +229,24 @@ pub fn get_recording_state(
 }
 
 #[tauri::command]
-pub fn run_sound_check(
+pub async fn run_sound_check(
     app: tauri::AppHandle,
-    recording_manager: tauri::State<'_, RecordingManager>,
-    sound_check_manager: tauri::State<'_, SoundCheckManager>,
     request: SoundCheckRequest,
 ) -> Result<SoundCheckResult, AppError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
-    sound_check_manager.run(
-        &recording_manager,
-        &data_dir,
-        request,
-        &TauriSoundCheckEventSink::new(app),
-    )
+    // The capture runs for the full test duration; keep it off the main
+    // thread so the UI stays responsive.
+    tauri::async_runtime::spawn_blocking(move || {
+        let recording_manager = app.state::<RecordingManager>();
+        let sound_check_manager = app.state::<SoundCheckManager>();
+        let events = Arc::new(TauriSoundCheckEventSink::new(app.clone()));
+        sound_check_manager.run(&recording_manager, &data_dir, request, events)
+    })
+    .await
+    .map_err(|err| AppError::new(IO_ERROR, format!("sound check task failed: {err}")))?
 }
 
 #[tauri::command]
