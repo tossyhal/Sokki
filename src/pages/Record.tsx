@@ -138,6 +138,9 @@ export default function Record() {
           />
 
           <div className="grid gap-5">
+            {needsMic && devices && devices.inputs.length === 0 ? (
+              <DeviceWarning message="利用できるマイクが見つかりません。Windowsの入力デバイス設定を確認してください。" />
+            ) : null}
             {needsMic ? (
               <SelectRow
                 label="マイク"
@@ -146,6 +149,9 @@ export default function Record() {
                 disabled={loading}
                 onChange={(value) => setMicDevice(value || null)}
               />
+            ) : null}
+            {needsSystem && devices && devices.outputs.length === 0 ? (
+              <DeviceWarning message="利用できる出力デバイスが見つかりません。システム音声録音にはWindowsの出力デバイスが必要です。" />
             ) : null}
             {needsSystem ? (
               <SelectRow
@@ -188,6 +194,14 @@ export default function Record() {
         </section>
       )}
     </section>
+  );
+}
+
+function DeviceWarning({ message }: { message: string }) {
+  return (
+    <div className="rounded-card border border-warn bg-warn-soft px-3 py-2 text-meta text-ink">
+      {message}
+    </div>
   );
 }
 

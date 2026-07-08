@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useNavigate, useParams } from "react-router-dom";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { exportSession, getSegments, retranscribeSession } from "../lib/api";
 import { formatDuration } from "../lib/format";
 import type { ExportFormat, Language, Segment, Session, SessionStatus, Source } from "../lib/types";
@@ -12,7 +13,16 @@ import { useSessionStore } from "../stores/useSessionStore";
 export default function SessionDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { selected, loading, cancelingId, error, loadOne, cancel } = useSessionStore();
+  const {
+    selected,
+    loading,
+    cancelingId,
+    deletingId,
+    error,
+    loadOne,
+    cancel,
+    delete: deleteSession,
+  } = useSessionStore();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [segmentError, setSegmentError] = useState<string | null>(null);
@@ -23,9 +33,12 @@ export default function SessionDetail() {
   const [retranscribing, setRetranscribing] = useState(false);
   const [retranscribeError, setRetranscribeError] = useState<string | null>(null);
   const [showExport, setShowExport] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [requestedSessionId, setRequestedSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     if (id) {
+      setRequestedSessionId(id);
       void loadOne(id);
     }
   }, [id, loadOne]);
@@ -139,6 +152,16 @@ export default function SessionDetail() {
               {cancelingId === session.id ? "停止中" : "文字起こし停止"}
             </button>
           ) : null}
+          {session ? (
+            <button
+              type="button"
+              onClick={() => setShowDeleteConfirm(true)}
+              disabled={deletingId === session.id}
+              className="h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate disabled:text-ink-3"
+            >
+              {deletingId === session.id ? "削除中" : "削除"}
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -152,11 +175,29 @@ export default function SessionDetail() {
         <div className="border-t border-line py-8 text-body text-ink-2">読み込み中</div>
       ) : null}
 
+      {!loading && !error && !session && requestedSessionId === id ? (
+        <div className="rounded-card border border-line bg-surface px-4 py-8 text-center">
+          <p className="text-title text-ink">セッションが見つかりません</p>
+          <button
+            type="button"
+            onClick={() => navigate("/")}
+            className="mt-4 h-10 rounded-btn border border-line-strong px-4 text-body font-semibold text-ink hover:bg-elevate"
+          >
+            ライブラリへ戻る
+          </button>
+        </div>
+      ) : null}
+
       {session ? (
         <>
           {session.status === "interrupted" ? (
             <div className="rounded-card border border-warn bg-warn-soft px-4 py-3 text-body text-ink">
               処理が中断されました。再文字起こしできます。
+            </div>
+          ) : null}
+          {session.status === "error" ? (
+            <div className="rounded-card border border-accent bg-accent-soft px-4 py-3 text-body text-ink">
+              セッションでエラーが発生しました。必要に応じて再文字起こしできます。
             </div>
           ) : null}
 
@@ -217,6 +258,24 @@ export default function SessionDetail() {
           session={session}
           onCancel={() => setShowExport(false)}
           onDone={() => setShowExport(false)}
+        />
+      ) : null}
+
+      {session && showDeleteConfirm ? (
+        <ConfirmDialog
+          title="セッションを削除"
+          message={`「${session.title}」を削除します。\n録音WAVと文字起こし結果も削除されます。`}
+          confirmLabel="削除"
+          confirming={deletingId === session.id}
+          onCancel={() => setShowDeleteConfirm(false)}
+          onConfirm={() => {
+            void deleteSession(session.id).then((deleted) => {
+              if (deleted) {
+                setShowDeleteConfirm(false);
+                navigate("/");
+              }
+            });
+          }}
         />
       ) : null}
     </section>

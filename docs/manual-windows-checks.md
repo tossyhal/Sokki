@@ -72,3 +72,6 @@ Prerequisite: a usable local Whisper model is available.
 - Confirm sound-check WAV and recording WAV playback through the WebView asset protocol.
 - Confirm `convertFileSrc` playback paths work after app restart.
 - Confirm `transcribing` sessions interrupted by app shutdown become `interrupted` on next launch and can be retranscribed.
+- Confirm `error` and `interrupted` sessions show visible badges/messages in the library and session detail views.
+- Confirm deleting from both the library card and session detail opens the in-app confirmation dialog and that canceling leaves the session intact.
+- Confirm the record setup view shows a clear warning when the selected source requires a missing input or output device.

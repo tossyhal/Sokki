@@ -21,7 +21,7 @@ interface SessionStore {
   applyStatus: (id: string, status: Session["status"], message?: string | null) => void;
   rename: (id: string, title: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
-  delete: (id: string) => Promise<void>;
+  delete: (id: string) => Promise<boolean>;
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -112,8 +112,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         set({ selected: null });
       }
       set({ deletingId: null });
+      return true;
     } catch (error) {
       set({ sessions: previous, error: errorMessage(error), deletingId: null });
+      return false;
     }
   },
 }));

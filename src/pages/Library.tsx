@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { formatDuration } from "../lib/format";
 import type { Session, SessionStatus, Source } from "../lib/types";
 import { useSessionStore } from "../stores/useSessionStore";
@@ -18,6 +19,7 @@ export default function Library() {
     cancel,
     delete: deleteSession,
   } = useSessionStore();
+  const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
 
   useEffect(() => {
     void load();
@@ -75,14 +77,27 @@ export default function Library() {
               onOpen={() => navigate(`/session/${session.id}`)}
               onRename={(title) => void rename(session.id, title)}
               onCancel={() => void cancel(session.id)}
-              onDelete={() => {
-                if (window.confirm(`「${session.title}」を削除しますか？`)) {
-                  void deleteSession(session.id);
-                }
-              }}
+              onDelete={() => setDeleteTarget(session)}
             />
           ))}
         </div>
+      ) : null}
+
+      {deleteTarget ? (
+        <ConfirmDialog
+          title="セッションを削除"
+          message={`「${deleteTarget.title}」を削除します。\n録音WAVと文字起こし結果も削除されます。`}
+          confirmLabel="削除"
+          confirming={deletingId === deleteTarget.id}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={() => {
+            void deleteSession(deleteTarget.id).then((deleted) => {
+              if (deleted) {
+                setDeleteTarget(null);
+              }
+            });
+          }}
+        />
       ) : null}
     </section>
   );
@@ -147,6 +162,9 @@ function SessionCard({
             {formatDate(session.createdAt)} / {formatDuration(session.durationMs)} /{" "}
             {sourceLabel(session.source)} / {session.language}
           </p>
+          {session.errorMessage ? (
+            <p className="mt-2 break-words text-meta text-ink-2">{session.errorMessage}</p>
+          ) : null}
         </button>
         <div className="flex shrink-0 items-center gap-2">
           {session.status === "transcribing" ? (
