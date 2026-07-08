@@ -67,6 +67,8 @@ Prerequisite: a usable local Whisper model is available.
 - Confirm microphone recording.
 - Confirm WASAPI loopback system-audio recording.
 - Confirm mic + system mix recording.
+- During an active microphone recording, unplug or disable the selected input device and confirm recording auto-stops, the WAV remains playable, and the session becomes `error` with a `DEVICE_LOST` message.
+- During an active system-audio or mix recording, disable the selected output device and confirm the same `DEVICE_LOST` auto-stop behavior.
 - Confirm sound-check WAV and recording WAV playback through the WebView asset protocol.
 - Confirm `convertFileSrc` playback paths work after app restart.
 - Confirm `transcribing` sessions interrupted by app shutdown become `interrupted` on next launch and can be retranscribed.

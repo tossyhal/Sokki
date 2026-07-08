@@ -17,7 +17,9 @@ use crate::error::{
 };
 use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
 use crate::transcription::segmenter::{RealtimeChunk, RealtimeSegmenter};
-use crate::transcription::worker::{TranscribeWorkerHandle, TranscribeWorkerState};
+use crate::transcription::worker::{
+    SessionStatusPayload, TranscribeWorkerHandle, TranscribeWorkerState, SESSION_STATUS_EVENT,
+};
 
 pub const RECORDING_LEVEL_EVENT: &str = "recording://level";
 pub const RECORDING_ELAPSED_EVENT: &str = "recording://elapsed";
@@ -87,6 +89,7 @@ pub trait RecordingEventSink: Send + Sync {
     fn emit_elapsed(&self, payload: RecordingElapsedPayload);
     fn emit_drops(&self, payload: RecordingDropsPayload);
     fn emit_limit(&self, payload: RecordingLimitPayload);
+    fn emit_session_status(&self, _payload: SessionStatusPayload) {}
 }
 
 pub trait RealtimeJobEnqueuer {
@@ -299,6 +302,77 @@ impl RecordingManager {
         result
     }
 
+    pub fn stop_with_error(
+        &self,
+        db: &Db,
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+        error: AppError,
+        events: Arc<dyn RecordingEventSink>,
+    ) -> Result<Option<Session>, AppError> {
+        let Some(mut active) = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned")
+            .take()
+        else {
+            return Ok(None);
+        };
+
+        let session_id = active.session_id.clone();
+        let mut error_message = format!("{}: {}", error.code, error.message);
+
+        let _ = active.event_stop_tx.send(());
+        if let Some(event_thread) = active.event_thread.take() {
+            let _ = event_thread.join();
+        }
+        self.active.store(false, Ordering::SeqCst);
+
+        if let Some(chunk) = active.segmenter.flush() {
+            if let Err(flush_error) = enqueue_realtime_chunk(&active, chunk, tracker, enqueuer) {
+                error_message.push_str("; realtime flush failed: ");
+                error_message.push_str(&flush_error.message);
+            }
+        }
+
+        let drop_count = active.drop_count.load(Ordering::Relaxed) as i64;
+        match active.writer.take() {
+            Some(writer) => match writer.finalize() {
+                Ok(duration_ms) => {
+                    if let Err(duration_error) =
+                        db.update_session_duration(&session_id, duration_ms as i64, drop_count)
+                    {
+                        error_message.push_str("; duration update failed: ");
+                        error_message.push_str(&duration_error.to_string());
+                    }
+                }
+                Err(finalize_error) => {
+                    error_message.push_str("; wav finalize failed: ");
+                    error_message.push_str(&finalize_error.message);
+                }
+            },
+            None => {
+                error_message.push_str("; wav writer is already closed");
+            }
+        }
+
+        db.update_session_status(&session_id, SessionStatus::Error, Some(&error_message))
+            .map_err(db_error)?;
+        tracker.recording_stopped(db, &session_id)?;
+
+        let session = db
+            .get_session(&session_id)
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::new(DB_ERROR, "recording session not found after stop"))?;
+        events.emit_session_status(SessionStatusPayload {
+            session_id,
+            status: session.status,
+            message: session.error_message.clone(),
+        });
+
+        Ok(Some(session))
+    }
+
     pub fn state(&self) -> Result<RecordingStateSnapshot, AppError> {
         let state = self
             .state
@@ -422,6 +496,10 @@ impl RecordingEventSink for TauriRecordingEventSink {
 
     fn emit_limit(&self, payload: RecordingLimitPayload) {
         let _ = self.app.emit(RECORDING_LIMIT_EVENT, payload);
+    }
+
+    fn emit_session_status(&self, payload: SessionStatusPayload) {
+        let _ = self.app.emit(SESSION_STATUS_EVENT, payload);
     }
 }
 
@@ -1050,6 +1128,75 @@ mod tests {
     }
 
     #[test]
+    fn device_lost_auto_stop_finalizes_wav_and_marks_session_error() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("device_lost_auto_stop_finalizes_wav_and_marks_session_error");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let events = Arc::new(TestRecordingEventSink::default());
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                events.clone(),
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &enqueuer)
+            .unwrap();
+
+        let session = manager
+            .stop_with_error(
+                &db,
+                &tracker,
+                &enqueuer,
+                AppError::new(crate::error::DEVICE_LOST, "input device disconnected"),
+                events.clone(),
+            )
+            .unwrap()
+            .expect("active recording should be stopped");
+
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.status, SessionStatus::Error);
+        assert_eq!(
+            session.error_message.as_deref(),
+            Some("DEVICE_LOST: input device disconnected")
+        );
+        assert!(session.duration_ms >= 800);
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        assert_eq!(enqueuer.jobs.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            tracker.finish(&db, &session_id, false).unwrap(),
+            crate::transcription::jobs::JobCompletion::Done {
+                session_id: session_id.clone()
+            }
+        );
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Error
+        );
+        assert!(events
+            .statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|status| status.session_id == session_id
+                && status.status == SessionStatus::Error
+                && status.message.as_deref() == Some("DEVICE_LOST: input device disconnected")));
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
     fn recording_limit_state_warns_once_then_reports_max_once() {
         let mut state = RecordingLimitState::default();
 
@@ -1151,6 +1298,7 @@ mod tests {
         elapsed: StdMutex<Vec<RecordingElapsedPayload>>,
         drops: StdMutex<Vec<RecordingDropsPayload>>,
         limits: StdMutex<Vec<RecordingLimitPayload>>,
+        statuses: StdMutex<Vec<SessionStatusPayload>>,
     }
 
     #[derive(Default)]
@@ -1188,6 +1336,10 @@ mod tests {
 
         fn emit_limit(&self, payload: RecordingLimitPayload) {
             self.limits.lock().unwrap().push(payload);
+        }
+
+        fn emit_session_status(&self, payload: SessionStatusPayload) {
+            self.statuses.lock().unwrap().push(payload);
         }
     }
 
