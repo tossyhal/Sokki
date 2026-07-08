@@ -4,6 +4,7 @@ use tauri::Manager;
 
 use crate::audio::decode::decode_audio_file;
 use crate::audio::devices::{self, AudioDevices};
+use crate::audio::pipeline::SharedCaptureErrorHandler;
 use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
 use crate::db::{Db, Language, Segment, Session, SessionStatus};
 use crate::error::{AppError, DB_ERROR, IO_ERROR};
@@ -14,7 +15,8 @@ use crate::import::{
     ImportSessionIdGenerator,
 };
 use crate::recording::{
-    RecordingManager, RecordingStateSnapshot, StartRecordingRequest, TauriRecordingEventSink,
+    RecordingManager, RecordingStartDeps, RecordingStateSnapshot, StartRecordingRequest,
+    TauriRecordingEventSink,
 };
 use crate::settings::{GpuMode, Settings, SettingsPatch, SettingsStore};
 use crate::sound_check::{
@@ -101,19 +103,98 @@ pub fn list_audio_devices() -> Result<AudioDevices, AppError> {
 pub fn start_recording(
     app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
+    settings_store: tauri::State<'_, SettingsStore>,
     recording_manager: tauri::State<'_, RecordingManager>,
+    tracker: tauri::State<'_, Arc<JobTracker>>,
+    worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
     request: StartRecordingRequest,
 ) -> Result<String, AppError> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|err| AppError::new(IO_ERROR, err.to_string()))?;
-    recording_manager.start(
-        &db,
-        &data_dir,
-        request,
-        std::sync::Arc::new(TauriRecordingEventSink::new(app)),
-    )
+    let settings = settings_store.load()?;
+    let deps = RecordingStartDeps {
+        tracker: Arc::clone(tracker.inner()),
+        enqueuer: Arc::clone(worker.inner())
+            as Arc<dyn crate::recording::RealtimeJobEnqueuer + Send + Sync>,
+        events: Arc::new(TauriRecordingEventSink::new(app.clone())),
+        on_capture_error: capture_error_handler(app.clone()),
+        on_max_duration: max_duration_handler(app),
+    };
+    recording_manager.start(&db, &data_dir, &settings, request, deps)
+}
+
+/// Auto-stops the active recording when a capture stream or WAV write fails.
+/// Runs the stop on a fresh thread: the handler is invoked from audio-adjacent
+/// threads that must not block, and `stop_with_error` joins the mixer thread.
+fn capture_error_handler(app: tauri::AppHandle) -> SharedCaptureErrorHandler {
+    Arc::new(move |error| {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let db = app.state::<Db>();
+            let recording_manager = app.state::<RecordingManager>();
+            let tracker = app.state::<Arc<JobTracker>>();
+            let worker = app.state::<Arc<TranscribeWorkerState>>();
+            let events = Arc::new(TauriRecordingEventSink::new(app.clone()));
+            match recording_manager.stop_with_error(
+                &db,
+                &tracker,
+                worker.inner().as_ref(),
+                error,
+                events,
+            ) {
+                Ok(Some(session)) => {
+                    log::warn!("recording auto-stopped after capture error: {}", session.id);
+                }
+                Ok(None) => {}
+                Err(stop_error) => {
+                    log::error!(
+                        "failed to auto-stop recording after capture error: {}",
+                        stop_error.message
+                    );
+                }
+            }
+        });
+    })
+}
+
+/// Stops the recording through the normal stop path once MAX_RECORDING_MS is
+/// reached, then notifies the frontend of the resulting session status.
+fn max_duration_handler(app: tauri::AppHandle) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let db = app.state::<Db>();
+            let recording_manager = app.state::<RecordingManager>();
+            let tracker = app.state::<Arc<JobTracker>>();
+            let worker = app.state::<Arc<TranscribeWorkerState>>();
+            match recording_manager.stop(&db, &tracker, worker.inner().as_ref()) {
+                Ok(session) => {
+                    log::info!(
+                        "recording auto-stopped at max duration: {} ({})",
+                        session.id,
+                        session.duration_ms
+                    );
+                    let events = TauriRecordingEventSink::new(app.clone());
+                    use crate::recording::RecordingEventSink;
+                    events.emit_session_status(
+                        crate::transcription::worker::SessionStatusPayload {
+                            session_id: session.id,
+                            status: session.status,
+                            message: session.error_message,
+                        },
+                    );
+                }
+                Err(stop_error) => {
+                    log::error!(
+                        "failed to auto-stop recording at max duration: {}",
+                        stop_error.message
+                    );
+                }
+            }
+        });
+    })
 }
 
 #[tauri::command]
@@ -135,9 +216,9 @@ pub fn stop_recording(
     db: tauri::State<'_, Db>,
     recording_manager: tauri::State<'_, RecordingManager>,
     tracker: tauri::State<'_, Arc<JobTracker>>,
-    worker: tauri::State<'_, TranscribeWorkerState>,
+    worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
 ) -> Result<Session, AppError> {
-    recording_manager.stop(&db, &tracker, &*worker)
+    recording_manager.stop(&db, &tracker, worker.inner().as_ref())
 }
 
 #[tauri::command]
@@ -172,7 +253,7 @@ pub fn import_files(
     db: tauri::State<'_, Db>,
     settings_store: tauri::State<'_, SettingsStore>,
     tracker: tauri::State<'_, Arc<JobTracker>>,
-    worker: tauri::State<'_, TranscribeWorkerState>,
+    worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
     id_generator: tauri::State<'_, ImportSessionIdGenerator>,
     request: ImportFilesRequest,
 ) -> Result<Vec<ImportFileResult>, AppError> {
@@ -197,7 +278,7 @@ pub fn import_files(
         db: &db,
         data_dir: &data_dir,
         tracker: tracker.as_ref(),
-        enqueuer: &*worker,
+        enqueuer: worker.inner().as_ref(),
         vad_threshold_db: settings.vad_threshold_db,
         available_space_bytes,
         session_id_generator: &next_id,
@@ -211,14 +292,14 @@ pub fn retranscribe_session(
     db: tauri::State<'_, Db>,
     settings_store: tauri::State<'_, SettingsStore>,
     tracker: tauri::State<'_, Arc<JobTracker>>,
-    worker: tauri::State<'_, TranscribeWorkerState>,
+    worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
     request: RetranscribeSessionRequest,
 ) -> Result<(), AppError> {
     let settings = settings_store.load()?;
     retranscribe_session_impl(
         &db,
         tracker.as_ref(),
-        &*worker,
+        worker.inner().as_ref(),
         settings.vad_threshold_db,
         request,
     )

@@ -67,7 +67,9 @@ pub fn run() {
             app.manage(sound_check::SoundCheckManager::new());
             app.manage(whisper_context);
             app.manage(tracker);
-            app.manage(transcription::worker::TranscribeWorkerState::new(worker));
+            app.manage(Arc::new(transcription::worker::TranscribeWorkerState::new(
+                worker,
+            )));
             app.manage(import::ImportSessionIdGenerator::new());
             log::info!("Sokki app data directory: {}", data_dir.display());
             Ok(())

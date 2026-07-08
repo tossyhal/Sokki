@@ -30,10 +30,16 @@ pub struct SourceLevels {
     pub system: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SourcePeaks {
+    pub mic: f32,
+    pub system: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MixedFrame {
     pub samples: Vec<f32>,
-    pub levels: Option<SourceLevels>,
+    pub levels: Option<(SourceLevels, SourcePeaks)>,
 }
 
 pub struct MixerCore {
@@ -146,6 +152,8 @@ impl JitterBuffer {
 struct LevelAccumulator {
     mic_square_sum: f32,
     system_square_sum: f32,
+    mic_peak: f32,
+    system_peak: f32,
     sample_count: usize,
 }
 
@@ -154,6 +162,8 @@ impl LevelAccumulator {
         Self {
             mic_square_sum: 0.0,
             system_square_sum: 0.0,
+            mic_peak: 0.0,
+            system_peak: 0.0,
             sample_count: 0,
         }
     }
@@ -161,10 +171,16 @@ impl LevelAccumulator {
     fn add(&mut self, mic: &[f32], system: &[f32]) {
         self.mic_square_sum += mic.iter().map(|sample| sample * sample).sum::<f32>();
         self.system_square_sum += system.iter().map(|sample| sample * sample).sum::<f32>();
+        for sample in mic {
+            self.mic_peak = self.mic_peak.max(sample.abs());
+        }
+        for sample in system {
+            self.system_peak = self.system_peak.max(sample.abs());
+        }
         self.sample_count += mic.len();
     }
 
-    fn take(&mut self) -> SourceLevels {
+    fn take(&mut self) -> (SourceLevels, SourcePeaks) {
         let levels = if self.sample_count == 0 {
             SourceLevels {
                 mic: 0.0,
@@ -176,8 +192,12 @@ impl LevelAccumulator {
                 system: (self.system_square_sum / self.sample_count as f32).sqrt(),
             }
         };
+        let peaks = SourcePeaks {
+            mic: self.mic_peak,
+            system: self.system_peak,
+        };
         *self = Self::new();
-        levels
+        (levels, peaks)
     }
 }
 
@@ -269,7 +289,7 @@ impl MixerThread {
         mut core: MixerCore,
         mut inputs: Vec<MixerInput>,
         mut sink: S,
-        mut on_level: impl FnMut(SourceLevels) + Send + 'static,
+        mut on_level: impl FnMut(SourceLevels, SourcePeaks) + Send + 'static,
         mut on_drops: impl FnMut(u64) + Send + 'static,
     ) -> Self
     where
@@ -297,8 +317,8 @@ impl MixerThread {
 
                 let frame = core.tick();
                 sink.write_frame(&frame.samples);
-                if let Some(levels) = frame.levels {
-                    on_level(levels);
+                if let Some((levels, peaks)) = frame.levels {
+                    on_level(levels, peaks);
                 }
 
                 next_tick += tick_duration;
@@ -316,8 +336,8 @@ impl MixerThread {
             while core.has_buffered_samples() {
                 let frame = core.tick();
                 sink.write_frame(&frame.samples);
-                if let Some(levels) = frame.levels {
-                    on_level(levels);
+                if let Some((levels, peaks)) = frame.levels {
+                    on_level(levels, peaks);
                 }
             }
         });
@@ -399,10 +419,12 @@ mod tests {
         }
 
         mixer.push(MixerSource::Mic, &[0.5; MIXER_FRAME_SAMPLES]);
-        let levels = mixer.tick().levels.expect("fifth tick should emit levels");
+        let (levels, peaks) = mixer.tick().levels.expect("fifth tick should emit levels");
 
         assert!((levels.mic - 0.5).abs() < 0.0001);
         assert_eq!(levels.system, 0.0);
+        assert!((peaks.mic - 0.5).abs() < 0.0001);
+        assert_eq!(peaks.system, 0.0);
     }
 
     #[test]
