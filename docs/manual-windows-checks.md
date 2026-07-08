@@ -23,6 +23,17 @@ Prerequisite: at least one session has transcript segments.
 - Cancel the native save dialog and confirm no file is written and the dialog remains usable.
 - Try exporting to an unwritable location and confirm an error is shown without crashing the app.
 
+## Realtime Transcription Pipeline
+
+Prerequisite: a usable local Whisper model is available.
+
+- Start a microphone recording and speak continuously for at least 10 seconds.
+- Confirm the first realtime transcript segment appears within 8 seconds plus inference time.
+- Confirm the segment around the 8-second boundary does not duplicate text from the 600ms overlap.
+- Start an import/batch transcription, then start recording while it is pending; confirm realtime recording is prioritized and the batch work resumes after recording stops.
+- Confirm the recorded WAV duration matches the recording length and the realtime transcript timestamps stay within the recorded duration.
+- Stop recording while realtime jobs are still pending and confirm the UI remains responsive without waiting for Whisper completion.
+
 ## Existing Desktop/Device Checks Still Required
 
 - Launch the generated Windows `.exe`.

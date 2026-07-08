@@ -9,18 +9,22 @@ use tauri::Emitter;
 
 use crate::audio::devices::{self, AudioDevice, AudioDevices};
 use crate::audio::mixer::SourceLevels;
-use crate::audio::wav::StreamingWavWriter;
+use crate::audio::wav::{StreamingWavWriter, WAV_SAMPLE_RATE};
 use crate::bootstrap::RECORDINGS_DIR;
 use crate::db::{Db, Language, Session, SessionStatus, Source};
 use crate::error::{
     AppError, ALREADY_RECORDING, DB_ERROR, DEVICE_NOT_FOUND, IO_ERROR, NOT_RECORDING,
 };
+use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+use crate::transcription::segmenter::{RealtimeChunk, RealtimeSegmenter};
+use crate::transcription::worker::{TranscribeWorkerHandle, TranscribeWorkerState};
 
 pub const RECORDING_LEVEL_EVENT: &str = "recording://level";
 pub const RECORDING_ELAPSED_EVENT: &str = "recording://elapsed";
 pub const RECORDING_DROPS_EVENT: &str = "recording://drops";
 const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 const ELAPSED_EVENT_INTERVAL_TICKS: u64 = 5;
+const DEFAULT_VAD_THRESHOLD_DB: i32 = -40;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -66,12 +70,16 @@ pub trait RecordingEventSink: Send + Sync {
     fn emit_drops(&self, payload: RecordingDropsPayload);
 }
 
+pub trait RealtimeJobEnqueuer {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError>;
+}
+
 pub struct TauriRecordingEventSink {
     app: tauri::AppHandle,
 }
 
 pub struct RecordingManager {
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
     id_counter: AtomicU64,
     state: Mutex<Option<ActiveRecording>>,
 }
@@ -80,6 +88,9 @@ struct ActiveRecording {
     session_id: String,
     timing: Arc<Mutex<RecordingTiming>>,
     writer: Option<StreamingWavWriter>,
+    segmenter: RealtimeSegmenter,
+    language: Language,
+    model: String,
     levels: Arc<Mutex<RecordingLevelPayload>>,
     drop_count: Arc<AtomicU64>,
     event_stop_tx: mpsc::Sender<()>,
@@ -96,7 +107,7 @@ struct RecordingTiming {
 impl RecordingManager {
     pub fn new() -> Self {
         Self {
-            active: AtomicBool::new(false),
+            active: Arc::new(AtomicBool::new(false)),
             id_counter: AtomicU64::new(0),
             state: Mutex::new(None),
         }
@@ -149,7 +160,7 @@ impl RecordingManager {
             audio_path: Some(wav_path.display().to_string()),
             source: request.source,
             language: request.language,
-            model: request.model,
+            model: request.model.clone(),
             status: SessionStatus::Recording,
             error_message: None,
             drop_count: 0,
@@ -175,6 +186,9 @@ impl RecordingManager {
             session_id: session_id.clone(),
             timing,
             writer: Some(writer),
+            segmenter: RealtimeSegmenter::new(WAV_SAMPLE_RATE, DEFAULT_VAD_THRESHOLD_DB),
+            language: request.language,
+            model: request.model,
             levels,
             drop_count,
             event_stop_tx,
@@ -279,6 +293,35 @@ impl RecordingManager {
         self.active.load(Ordering::SeqCst)
     }
 
+    pub fn recording_active_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active)
+    }
+
+    pub fn record_mixed_samples(
+        &self,
+        samples: &[f32],
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+    ) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let active = state
+            .as_mut()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+        active
+            .writer
+            .as_mut()
+            .ok_or_else(|| AppError::new(IO_ERROR, "wav writer is already closed"))?
+            .write_frame(samples)?;
+
+        for chunk in active.segmenter.push(samples) {
+            enqueue_realtime_chunk(active, chunk, tracker, enqueuer)?;
+        }
+        Ok(())
+    }
+
     pub fn update_levels(&self, levels: SourceLevels) -> Result<(), AppError> {
         let state = self
             .state
@@ -301,6 +344,18 @@ impl RecordingManager {
     fn next_session_id(&self) -> String {
         let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
         format!("rec-{}-{counter}", unix_time_ms())
+    }
+}
+
+impl RealtimeJobEnqueuer for TranscribeWorkerHandle {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_rt(job)
+    }
+}
+
+impl RealtimeJobEnqueuer for TranscribeWorkerState {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_rt(job)
     }
 }
 
@@ -403,6 +458,33 @@ fn recording_wav_path(data_dir: &Path, session_id: &str) -> PathBuf {
         .join(format!("{session_id}.wav"))
 }
 
+fn enqueue_realtime_chunk(
+    active: &ActiveRecording,
+    chunk: RealtimeChunk,
+    tracker: &JobTracker,
+    enqueuer: &dyn RealtimeJobEnqueuer,
+) -> Result<(), AppError> {
+    let canceled = tracker.enqueue(&active.session_id);
+    let job = TranscribeJob {
+        session_id: active.session_id.clone(),
+        kind: JobKind::Rt,
+        audio: chunk.audio,
+        chunk_start_ms: chunk.chunk_start_ms,
+        valid_start_ms: chunk.valid_start_ms,
+        valid_end_ms: chunk.valid_end_ms,
+        session_duration_ms: chunk.valid_end_ms,
+        language: active.language,
+        model: active.model.clone(),
+        canceled,
+    };
+
+    if let Err(error) = enqueuer.enqueue_rt_job(job) {
+        tracker.discard_enqueued(&active.session_id);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn unix_time_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -472,6 +554,7 @@ fn validate_device(
 mod tests {
     use super::*;
     use crate::db::{Db, Language, SessionStatus, Source};
+    use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
 
@@ -703,6 +786,114 @@ mod tests {
         std::fs::remove_dir_all(data_dir).unwrap();
     }
 
+    #[test]
+    fn record_mixed_samples_writes_wav_and_enqueues_realtime_jobs() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("record_mixed_samples_writes_wav_and_enqueues_realtime_jobs");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(900), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&silence_ms(720), &tracker, &enqueuer)
+            .unwrap();
+
+        let jobs = enqueuer.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.session_id, session_id);
+        assert_eq!(job.kind, JobKind::Rt);
+        assert_eq!(job.chunk_start_ms, 0);
+        assert_eq!(job.valid_start_ms, 300);
+        assert_eq!(job.valid_end_ms, 1_200);
+        assert_eq!(job.session_duration_ms, 1_200);
+        assert_eq!(job.language, Language::Ja);
+        assert_eq!(job.model, "medium-q5_0");
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Recording
+        );
+        drop(jobs);
+
+        let session = manager.stop(&db).unwrap();
+        assert!(session.duration_ms >= 1_900);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn recording_active_flag_is_shared_for_worker_preemption() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("recording_active_flag_is_shared_for_worker_preemption");
+        let manager = RecordingManager::new();
+        let active = manager.recording_active_flag();
+
+        assert!(!active.load(Ordering::SeqCst));
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
+            .unwrap();
+
+        assert!(active.load(Ordering::SeqCst));
+        manager.stop(&db).unwrap();
+        assert!(!active.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn record_mixed_samples_rolls_back_pending_when_rt_enqueue_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir =
+            temp_data_dir("record_mixed_samples_rolls_back_pending_when_rt_enqueue_fails");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                sample_request(Source::Mic),
+                &sample_devices(),
+                Arc::new(TestRecordingEventSink::default()),
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(
+                &[silence_ms(300), tone_ms(900), silence_ms(720)].concat(),
+                &tracker,
+                &FailingRealtimeJobEnqueuer,
+            )
+            .unwrap_err();
+
+        assert_eq!(tracker.pending_count(&session_id), 0);
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Recording
+        );
+        manager.stop(&db).unwrap();
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
     fn sample_request(source: Source) -> StartRecordingRequest {
         StartRecordingRequest {
             source,
@@ -728,6 +919,18 @@ mod tests {
         }
     }
 
+    fn tone_ms(ms: u64) -> Vec<f32> {
+        vec![0.2; samples_for_ms(ms)]
+    }
+
+    fn silence_ms(ms: u64) -> Vec<f32> {
+        vec![0.0; samples_for_ms(ms)]
+    }
+
+    fn samples_for_ms(ms: u64) -> usize {
+        (crate::audio::wav::WAV_SAMPLE_RATE as u64 * ms / 1_000) as usize
+    }
+
     fn temp_data_dir(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("sokki-recording-{name}"));
         let _ = std::fs::remove_dir_all(&path);
@@ -740,6 +943,26 @@ mod tests {
         levels: StdMutex<Vec<RecordingLevelPayload>>,
         elapsed: StdMutex<Vec<RecordingElapsedPayload>>,
         drops: StdMutex<Vec<RecordingDropsPayload>>,
+    }
+
+    #[derive(Default)]
+    struct TestRealtimeJobEnqueuer {
+        jobs: StdMutex<Vec<TranscribeJob>>,
+    }
+
+    impl RealtimeJobEnqueuer for TestRealtimeJobEnqueuer {
+        fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+    }
+
+    struct FailingRealtimeJobEnqueuer;
+
+    impl RealtimeJobEnqueuer for FailingRealtimeJobEnqueuer {
+        fn enqueue_rt_job(&self, _job: TranscribeJob) -> Result<(), AppError> {
+            Err(AppError::new(DB_ERROR, "rt worker unavailable"))
+        }
     }
 
     impl RecordingEventSink for TestRecordingEventSink {

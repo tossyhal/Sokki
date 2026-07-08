@@ -111,6 +111,13 @@ impl TranscribeWorkerState {
             .expect("transcription worker mutex should not be poisoned")
             .enqueue_batch(job)
     }
+
+    pub fn enqueue_rt(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.handle
+            .lock()
+            .expect("transcription worker mutex should not be poisoned")
+            .enqueue_rt(job)
+    }
 }
 
 impl TranscribeWorkerHandle {

@@ -94,6 +94,23 @@ impl JobTracker {
         }
     }
 
+    pub fn discard_enqueued(&self, session_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("job tracker mutex should not be poisoned");
+        let Some(pending) = state.pending.get_mut(session_id) else {
+            return;
+        };
+        if *pending > 0 {
+            *pending -= 1;
+        }
+        if *pending == 0 {
+            state.pending.remove(session_id);
+            state.cancel_flags.remove(session_id);
+        }
+    }
+
     pub fn finish(
         &self,
         db: &Db,
@@ -246,6 +263,24 @@ mod tests {
         assert!(!job.canceled());
         assert!(tracker.cancel("session-a"));
         assert!(job.canceled());
+    }
+
+    #[test]
+    fn discard_enqueued_rolls_back_pending_without_status_change() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        db.insert_session(&sample_session("session-a", SessionStatus::Recording))
+            .expect("session should insert");
+        let tracker = JobTracker::new();
+        let flag = tracker.enqueue("session-a");
+
+        tracker.discard_enqueued("session-a");
+
+        assert_eq!(tracker.pending_count("session-a"), 0);
+        assert!(!flag.load(Ordering::SeqCst));
+        assert_eq!(
+            db.get_session("session-a").unwrap().unwrap().status,
+            SessionStatus::Recording
+        );
     }
 
     fn sample_session(id: &str, status: SessionStatus) -> Session {

@@ -11,7 +11,6 @@ pub mod settings;
 pub mod sound_check;
 pub mod transcription;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -37,7 +36,8 @@ pub fn run() {
             let initial_settings = settings_store.load()?;
             let whisper_context = Arc::new(transcription::context::WhisperContextManager::new());
             let tracker = Arc::new(transcription::jobs::JobTracker::new());
-            let transcription_active = Arc::new(AtomicBool::new(false));
+            let recording_manager = recording::RecordingManager::new();
+            let transcription_active = recording_manager.recording_active_flag();
             let processor = Arc::new(transcription::inference::WhisperJobProcessor::new(
                 Arc::clone(&worker_db),
                 Arc::clone(&whisper_context),
@@ -55,7 +55,7 @@ pub fn run() {
                 )),
             );
             app.manage(db);
-            app.manage(recording::RecordingManager::new());
+            app.manage(recording_manager);
             app.manage(settings_store);
             app.manage(sound_check::SoundCheckManager::new());
             app.manage(whisper_context);
