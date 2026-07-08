@@ -4,7 +4,7 @@ use tauri::Manager;
 
 use crate::audio::devices::{self, AudioDevices};
 use crate::bootstrap::{MODELS_DIR, RECORDINGS_DIR};
-use crate::db::{Db, Session};
+use crate::db::{Db, Segment, Session};
 use crate::error::{AppError, DB_ERROR, IO_ERROR};
 use crate::import::{
     available_space_for_path, ImportFileResult, ImportFilesRequest, ImportPipeline,
@@ -194,6 +194,14 @@ pub fn get_session(db: tauri::State<'_, Db>, id: String) -> Result<Session, AppE
 }
 
 #[tauri::command]
+pub fn get_segments(
+    db: tauri::State<'_, Db>,
+    session_id: String,
+) -> Result<Vec<Segment>, AppError> {
+    get_segments_impl(&db, &session_id)
+}
+
+#[tauri::command]
 pub fn rename_session(
     db: tauri::State<'_, Db>,
     id: String,
@@ -230,6 +238,11 @@ fn get_session_impl(db: &Db, id: &str) -> Result<Session, AppError> {
     db.get_session(id)
         .map_err(db_error)?
         .ok_or_else(|| session_not_found(id))
+}
+
+fn get_segments_impl(db: &Db, session_id: &str) -> Result<Vec<Segment>, AppError> {
+    let _ = get_session_impl(db, session_id)?;
+    db.list_segments(session_id).map_err(db_error)
 }
 
 fn cancel_transcription_impl(db: &Db, tracker: &JobTracker, id: &str) -> Result<Session, AppError> {
@@ -299,6 +312,48 @@ mod tests {
         let db = Db::open_in_memory().expect("in-memory db should migrate");
 
         let error = get_session_impl(&db, "missing").unwrap_err();
+
+        assert_eq!(error.code, DB_ERROR);
+        assert_eq!(error.message, "session not found: missing");
+    }
+
+    #[test]
+    fn get_segments_impl_returns_ordered_session_segments() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+        db.insert_session(&sample_session("session-a", SessionStatus::Done))
+            .expect("session should insert");
+        db.insert_segment(&crate::db::NewSegment {
+            session_id: "session-a".to_string(),
+            start_ms: 2_000,
+            end_ms: 3_000,
+            text: "second".to_string(),
+            lang: Some("ja".to_string()),
+        })
+        .expect("segment should insert");
+        db.insert_segment(&crate::db::NewSegment {
+            session_id: "session-a".to_string(),
+            start_ms: 1_000,
+            end_ms: 1_500,
+            text: "first".to_string(),
+            lang: Some("ja".to_string()),
+        })
+        .expect("segment should insert");
+
+        let segments = get_segments_impl(&db, "session-a").expect("segments should load");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "first");
+        assert_eq!(segments[1].text, "second");
+        let value = serde_json::to_value(&segments[0]).expect("Segment should serialize");
+        assert_eq!(value["sessionId"], json!("session-a"));
+        assert_eq!(value["startMs"], json!(1_000));
+    }
+
+    #[test]
+    fn get_segments_impl_rejects_missing_session() {
+        let db = Db::open_in_memory().expect("in-memory db should migrate");
+
+        let error = get_segments_impl(&db, "missing").unwrap_err();
 
         assert_eq!(error.code, DB_ERROR);
         assert_eq!(error.message, "session not found: missing");

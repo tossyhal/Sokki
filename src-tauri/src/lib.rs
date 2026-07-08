@@ -66,6 +66,7 @@ pub fn run() {
             commands::cancel_transcription,
             commands::delete_session,
             commands::get_session,
+            commands::get_segments,
             commands::get_sessions,
             commands::get_system_info,
             commands::import_files,

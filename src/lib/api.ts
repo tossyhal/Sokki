@@ -4,6 +4,7 @@ import type {
   ImportFileResult,
   ImportFilesRequest,
   RecordingState,
+  Segment,
   Session,
   Settings,
   SoundCheckRequest,
@@ -66,6 +67,10 @@ export function getSessions(): Promise<Session[]> {
 
 export function getSession(id: string): Promise<Session> {
   return invoke<Session>("get_session", { id });
+}
+
+export function getSegments(sessionId: string): Promise<Segment[]> {
+  return invoke<Segment[]>("get_segments", { sessionId });
 }
 
 export function renameSession(id: string, title: string): Promise<Session> {

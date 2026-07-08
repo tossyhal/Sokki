@@ -7,12 +7,13 @@ use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
 use serde::Serialize;
 use tauri::Emitter;
 
-use crate::db::{Db, NewSegment, SessionStatus};
+use crate::db::{Db, NewSegment, Segment, SessionStatus};
 use crate::error::{AppError, DB_ERROR};
 use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const IMPORT_PROGRESS_EVENT: &str = "import://progress";
+pub const TRANSCRIPT_SEGMENT_EVENT: &str = "transcript://segment";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,12 +24,15 @@ pub struct ImportProgressPayload {
 
 pub trait TranscriptionEventSink: Send + Sync + 'static {
     fn emit_import_progress(&self, payload: ImportProgressPayload);
+    fn emit_transcript_segment(&self, segment: Segment);
 }
 
 pub struct NoopTranscriptionEventSink;
 
 impl TranscriptionEventSink for NoopTranscriptionEventSink {
     fn emit_import_progress(&self, _payload: ImportProgressPayload) {}
+
+    fn emit_transcript_segment(&self, _segment: Segment) {}
 }
 
 pub struct TauriTranscriptionEventSink {
@@ -44,6 +48,10 @@ impl TauriTranscriptionEventSink {
 impl TranscriptionEventSink for TauriTranscriptionEventSink {
     fn emit_import_progress(&self, payload: ImportProgressPayload) {
         let _ = self.app.emit(IMPORT_PROGRESS_EVENT, payload);
+    }
+
+    fn emit_transcript_segment(&self, segment: Segment) {
+        let _ = self.app.emit(TRANSCRIPT_SEGMENT_EVENT, segment);
     }
 }
 
@@ -264,21 +272,30 @@ fn process_or_finish(
     let result = runtime.processor.process(&job, &should_abort);
     match result {
         Ok(JobProcessResult::Completed { segments }) => {
-            let persisted = insert_segments(&runtime.db, segments).is_ok();
-            if !persisted {
-                let _ = runtime.db.update_session_status(
-                    &job.session_id,
-                    SessionStatus::Error,
-                    Some("failed to persist transcription segments"),
-                );
-            }
-            let _ = runtime.tracker.finish(
-                &runtime.db,
-                &job.session_id,
-                runtime.recording_active.load(Ordering::SeqCst),
-            );
-            if persisted {
-                emit_import_progress(&runtime.events, &job);
+            match insert_segments(&runtime.db, segments) {
+                Ok(inserted_segments) => {
+                    for segment in inserted_segments {
+                        runtime.events.emit_transcript_segment(segment);
+                    }
+                    let _ = runtime.tracker.finish(
+                        &runtime.db,
+                        &job.session_id,
+                        runtime.recording_active.load(Ordering::SeqCst),
+                    );
+                    emit_import_progress(&runtime.events, &job);
+                }
+                Err(_) => {
+                    let _ = runtime.db.update_session_status(
+                        &job.session_id,
+                        SessionStatus::Error,
+                        Some("failed to persist transcription segments"),
+                    );
+                    let _ = runtime.tracker.finish(
+                        &runtime.db,
+                        &job.session_id,
+                        runtime.recording_active.load(Ordering::SeqCst),
+                    );
+                }
             }
         }
         Ok(JobProcessResult::Aborted) => {
@@ -314,14 +331,16 @@ fn emit_import_progress(events: &Arc<dyn TranscriptionEventSink>, job: &Transcri
     });
 }
 
-fn insert_segments(db: &Db, segments: Vec<NewSegment>) -> Result<(), AppError> {
+fn insert_segments(db: &Db, segments: Vec<NewSegment>) -> Result<Vec<Segment>, AppError> {
+    let mut inserted = Vec::with_capacity(segments.len());
     for segment in segments {
-        db.insert_segment(&segment)
-            .map_err(|error| AppError::new(DB_ERROR, format!("database error: {error}")))?;
+        inserted.push(
+            db.insert_segment(&segment)
+                .map_err(|error| AppError::new(DB_ERROR, format!("database error: {error}")))?,
+        );
     }
-    Ok(())
+    Ok(inserted)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +559,34 @@ mod tests {
         worker.shutdown();
     }
 
+    #[test]
+    fn completed_job_emits_inserted_transcript_segments() {
+        let fixture = WorkerFixture::new();
+        fixture.insert_session("session-a");
+        let processor = Arc::new(SegmentProcessor);
+        let events = Arc::new(RecordingEventSink::default());
+        let worker = TranscribeWorkerHandle::start(
+            Arc::clone(&fixture.db),
+            Arc::clone(&fixture.tracker),
+            Arc::clone(&fixture.recording_active),
+            processor,
+            events.clone(),
+        );
+
+        worker
+            .enqueue_batch(fixture.job("session-a", JobKind::Batch))
+            .unwrap();
+
+        eventually_done(&fixture, "session-a");
+        let emitted = events.segments.lock().unwrap().clone();
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].id > 0);
+        assert_eq!(emitted[0].session_id, "session-a");
+        assert_eq!(emitted[0].start_ms, 100);
+        assert_eq!(emitted[0].text, "hello");
+        worker.shutdown();
+    }
+
     struct RecordingProcessor {
         processed_tx: ProcessedSender,
         processed_rx: ProcessedReceiver,
@@ -582,6 +629,26 @@ mod tests {
         }
     }
 
+    struct SegmentProcessor;
+
+    impl JobProcessor for SegmentProcessor {
+        fn process(
+            &self,
+            job: &TranscribeJob,
+            _should_abort: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<JobProcessResult, AppError> {
+            Ok(JobProcessResult::Completed {
+                segments: vec![NewSegment {
+                    session_id: job.session_id.clone(),
+                    start_ms: 100,
+                    end_ms: 500,
+                    text: "hello".to_string(),
+                    lang: Some("en".to_string()),
+                }],
+            })
+        }
+    }
+
     struct AbortFirstBatchProcessor {
         processed_tx: ProcessedSender,
         attempt: AtomicUsize,
@@ -616,11 +683,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingEventSink {
         payloads: Mutex<Vec<ImportProgressPayload>>,
+        segments: Mutex<Vec<Segment>>,
     }
 
     impl TranscriptionEventSink for RecordingEventSink {
         fn emit_import_progress(&self, payload: ImportProgressPayload) {
             self.payloads.lock().unwrap().push(payload);
+        }
+
+        fn emit_transcript_segment(&self, segment: Segment) {
+            self.segments.lock().unwrap().push(segment);
         }
     }
 

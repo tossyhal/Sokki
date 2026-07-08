@@ -61,6 +61,15 @@ export interface Session {
   dropCount: number;
 }
 
+export interface Segment {
+  id: number;
+  sessionId: string;
+  startMs: number;
+  endMs: number;
+  text: string;
+  lang: string | null;
+}
+
 export interface StartRecordingRequest {
   source: Exclude<Source, "import">;
   language: Language;
