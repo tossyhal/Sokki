@@ -25,7 +25,7 @@ These checks can be run from WSL before Windows handoff:
 Latest WSL-produced artifact:
 
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe`
-- Size: 25,618,032 bytes
+- Size: 25,619,629 bytes
 - Result: produced successfully from WSL2 cross build on 2026-07-09.
 - Note: this proves packaging only. Launch, installation, WebView2, microphone, WASAPI loopback, mix capture, and asset-protocol playback still require Windows 10/11 x64 manual checks.
 
@@ -103,6 +103,7 @@ Prerequisite: at least one usable local Whisper model is available.
 Prerequisite: a usable local Whisper model is available.
 
 - Start a microphone recording and speak continuously for at least 10 seconds.
+- Confirm the Record page live transcript panel appends realtime segments while recording, keeps the latest segment in view by default, and shows the `最新へ` control after manually scrolling away from the bottom.
 - Confirm the session detail transcript shows the live badge and pending row while recording/transcribing.
 - Confirm the first realtime transcript segment appears within 8 seconds plus inference time.
 - Confirm new realtime segments auto-scroll into view without obscuring the playback controls or header actions.

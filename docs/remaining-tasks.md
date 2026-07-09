@@ -54,7 +54,7 @@
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 - `chore: verify cpu nsis cross build`
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
-  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,618,032 bytes)。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,619,629 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 - `docs: add readme with build and release instructions`
   - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。
@@ -70,6 +70,10 @@
 - `chore: add frontend typecheck gate`
   - `tsconfig.json` の `types` を React / Vite に限定し、不要な implicit `@types/*` 探索による `TS2688` を解消。
   - `pnpm typecheck` (`tsc --noEmit`) を追加し、既存の ref / action narrowing / nullable selected 型エラーを修正。
+- `feat: show live transcript on record page`
+  - Record 録音中画面に `transcript://segment` 由来のライブセグメント表示を追加。
+  - 最新セグメントへの自動スクロール、手動スクロール解除、`最新へ` 復帰、認識中 pending 行を表示。
+  - Windows実機での録音中セグメント到着・スクロール挙動は `docs/manual-windows-checks.md` に追記。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -78,7 +82,7 @@
 ### 1. フロントエンド残ギャップ(spec §8 総点検)
 
 - §8 の画面仕様と現実装の突き合わせ。少なくとも以下を確認:
-  - Record ページ: モデル選択は usable のみ活性、`recording://limit` 警告表示、サウンドチェック再生UIは実装済み。Windows実機で操作確認が必要。
+  - Record ページ: モデル選択は usable のみ活性、`recording://limit` 警告表示、サウンドチェック再生UI、ライブ文字起こしUIは実装済み。Windows実機で操作確認が必要。
   - サウンドチェック結果の再生ゲート(§9、`$APPDATA` scope)が実機で通るか。
   - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
 - Windows実機確認後、§13 受入チェックリストの PENDING_WINDOWS 項目を `docs/acceptance.md` に記録する。

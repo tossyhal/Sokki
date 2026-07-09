@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { formatDuration } from "../lib/format";
 import { useModelStore } from "../stores/useModelStore";
 import { useRecordingStore } from "../stores/useRecordingStore";
-import type { AudioDevice, Language, ModelInfo, SoundCheckResult, Source } from "../lib/types";
+import { useSessionStore } from "../stores/useSessionStore";
+import type { AudioDevice, Language, ModelInfo, Segment, SoundCheckResult, Source } from "../lib/types";
 
 type RecordingSource = Exclude<Source, "import">;
 
@@ -28,6 +29,7 @@ export default function Record() {
     error: modelError,
     load: loadModels,
   } = useModelStore();
+  const { liveSegmentsBySession } = useSessionStore();
   const {
     devices,
     state,
@@ -63,6 +65,7 @@ export default function Record() {
   const needsMic = setup.source === "mic" || setup.source === "mix";
   const needsSystem = setup.source === "system" || setup.source === "mix";
   const selectedModel = models.find((model) => model.name === setup.model);
+  const liveSegments = state.sessionId ? (liveSegmentsBySession[state.sessionId] ?? []) : [];
   const selectedModelUsable = Boolean(selectedModel?.usable && !selectedModel.corrupted);
   const modelOptions =
     models.length > 0
@@ -115,6 +118,7 @@ export default function Record() {
           systemLevel={levels.system}
           dropCount={dropCount}
           durationLimitWarning={durationLimitWarning}
+          liveSegments={liveSegments}
           stopping={stopping}
           onPause={() => void pause()}
           onResume={() => void resume()}
@@ -331,6 +335,7 @@ function RecordingInProgress({
   systemLevel,
   dropCount,
   durationLimitWarning,
+  liveSegments,
   stopping,
   onPause,
   onResume,
@@ -343,6 +348,7 @@ function RecordingInProgress({
   systemLevel: number;
   dropCount: number;
   durationLimitWarning: string | null;
+  liveSegments: Segment[];
   stopping: boolean;
   onPause: () => void;
   onResume: () => void;
@@ -372,6 +378,8 @@ function RecordingInProgress({
         <LevelMeter label="マイク" value={micLevel} />
         <LevelMeter label="システム音声" value={systemLevel} />
       </div>
+
+      <LiveTranscriptPanel segments={liveSegments} />
 
       {durationLimitWarning ? (
         <div className="rounded-card border border-warn bg-warn-soft px-3 py-2 text-meta text-ink">
@@ -407,6 +415,74 @@ function RecordingInProgress({
         >
           {stopping ? "停止中" : "停止"}
         </button>
+      </div>
+    </section>
+  );
+}
+
+function LiveTranscriptPanel({ segments }: { segments: Segment[] }) {
+  const [autoScroll, setAutoScroll] = useState(true);
+  const endRef = useRef<HTMLDivElement | null>(null);
+  const hasSegments = segments.length > 0;
+
+  useEffect(() => {
+    if (autoScroll) {
+      endRef.current?.scrollIntoView({ block: "end" });
+    }
+  }, [autoScroll, segments.length]);
+
+  const jumpToLatest = () => {
+    setAutoScroll(true);
+    requestAnimationFrame(() => endRef.current?.scrollIntoView({ block: "end" }));
+  };
+
+  return (
+    <section className="grid gap-3 border-t border-line pt-5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-title">ライブ文字起こし</h2>
+          <p className="mt-1 text-meta text-ink-2">
+            {hasSegments ? `${segments.length} セグメント` : "発話を待機中"}
+          </p>
+        </div>
+        {!autoScroll ? (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="h-9 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate"
+          >
+            最新へ
+          </button>
+        ) : null}
+      </div>
+
+      <div
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+          setAutoScroll(distanceFromBottom < 32);
+        }}
+        className="grid max-h-64 gap-2 overflow-y-auto rounded-card border border-line bg-surface p-3"
+      >
+        {segments.map((segment) => (
+          <div
+            key={segment.id}
+            className="grid grid-cols-[72px_1fr] gap-3 rounded-card border border-line bg-surface-2 px-3 py-3 animate-seg-in"
+          >
+            <span className="text-meta font-semibold tabular-nums text-ink-2">
+              {formatTimestamp(segment.startMs)}
+            </span>
+            <span className="text-body text-ink">{segment.text}</span>
+          </div>
+        ))}
+        <div className="grid grid-cols-[72px_1fr] gap-3 rounded-card border border-dashed border-line-strong bg-surface px-3 py-3">
+          <span className="text-meta font-semibold text-ink-3">LIVE</span>
+          <span className="inline-flex items-center gap-2 text-body text-ink-2">
+            <span className="h-2 w-2 rounded-full bg-accent motion-safe:animate-rec-pulse" />
+            認識中…
+          </span>
+        </div>
+        <div ref={endRef} />
       </div>
     </section>
   );
@@ -494,4 +570,11 @@ function modelSelectLabel(model: ModelInfo) {
 
 function deviceSummary(inputCount: number | undefined, outputCount: number | undefined) {
   return `入力 ${inputCount ?? 0} / 出力 ${outputCount ?? 0}`;
+}
+
+function formatTimestamp(timestampMs: number) {
+  const totalSeconds = Math.floor(timestampMs / 1_000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
