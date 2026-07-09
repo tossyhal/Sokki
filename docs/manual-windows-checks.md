@@ -25,7 +25,7 @@ Windows 引き継ぎ前に WSL で実行できる確認:
 最新の WSL 生成成果物:
 
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe`
-- サイズ: 25,617,138 bytes
+- サイズ: 25,612,176 bytes
 - 結果: 2026-07-09 に WSL2 クロスビルドで生成成功。
 - 注意: これは package 生成の確認に限る。起動、インストール、WebView2、マイク、WASAPI loopback、mix capture、asset protocol 再生は Windows 10/11 x64 実機確認が必要。
 
@@ -57,12 +57,15 @@ NG / 再確認待ち:
 - export TXT/SRT/MD: transcript segment が作られなかったため未確認。
 - import: 文字起こしが動いていないため未確認。
 - interrupted復旧: 文字起こしが動いていないため未確認。
-- サウンドチェック入力レベル: 大きめの音量でも入力レベルが一桁に見えた。修正後はメーターを線形パーセントではなくdBFSベース表示に変更したため、見え方を再確認する。
+- サウンドチェック入力レベル: dBFS表記が非直感的だった。修正後は0-100の圧縮メーター表示に変更したため、見え方を再確認する。
+- 文字起こし速度: CPU版 `medium-q5_0` では遅く感じる。修正後は realtime 強制確定を5秒へ短縮したため、初回表示と停止後遷移を再確認する。速度優先の場合は `small` / `base` モデルも確認する。
+- 音声再生速度: 修正後は0.5x〜3.0xを0.05刻みで変更できるスライダーを確認する。
+- エラー表示: 修正後は SessionDetail のセッションエラー説明と詳細メッセージを1箇所に集約し、音声プレイヤー直前の重複表示がないことを確認する。
 
 対応:
 
 - Whisper job が catalog の `fileName` ではなく model name をファイル名として渡していたため、`models\medium-q5_0` のような存在しないパスで context 作成していた。修正後の成果物で realtime/batch/retranscribe/import/export を再確認する。
-- 音声レベルメーターは RMS の線形値をそのまま表示していたため、実用音量でも一桁に見えやすかった。表示をdBFSベースに変更し、backendの録音ゲインや保存音声は変更していない。
+- 音声レベルメーターは RMS の線形値をそのまま表示していたため、実用音量でも一桁に見えやすかった。表示を0-100の圧縮メーターに変更し、backendの録音ゲインや保存音声は変更していない。
 
 stop/status 変更について WSL テストで確認すべきこと:
 
@@ -140,9 +143,9 @@ stop/status 変更について WSL テストで確認すべきこと:
 - マイク録音を開始し、10秒以上連続して発話する。
 - Record ページのライブ文字起こしパネルに realtime segment が追加され、通常は最新 segment が見える位置まで自動スクロールし、手動で下端から離れると `最新へ` が表示されることを確認する。
 - セッション詳細の transcript に、録音中/文字起こし中の live badge と pending row が表示されることを確認する。
-- 最初の realtime transcript segment が8秒+推論時間以内に表示されることを確認する。
+- 最初の realtime transcript segment が5秒+推論時間以内に表示されることを確認する。
 - 新しい realtime segment が playback controls や header actions を隠さずに表示されることを確認する。
-- 8秒境界付近の segment で、600ms overlap 由来の重複テキストが出ないことを確認する。
+- 5秒境界付近の segment で、600ms overlap 由来の重複テキストが出ないことを確認する。
 - import/batch transcription の pending 中に録音を開始し、realtime recording が優先され、録音停止後に batch work が再開することを確認する。
 - 録音WAV duration が録音時間と一致し、realtime transcript timestamp が録音 duration 内に収まることを確認する。
 - realtime job が pending の状態で録音停止し、Whisper 完了を待たずに UI が即セッション詳細へ移動することを確認する。

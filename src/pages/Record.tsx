@@ -29,7 +29,7 @@ export default function Record() {
     error: modelError,
     load: loadModels,
   } = useModelStore();
-  const { liveSegmentsBySession } = useSessionStore();
+  const { liveSegmentsBySession, loadOne: loadSession } = useSessionStore();
   const {
     devices,
     state,
@@ -123,9 +123,16 @@ export default function Record() {
           onPause={() => void pause()}
           onResume={() => void resume()}
           onStop={() => {
+            const sessionId = state.sessionId;
+            if (sessionId) {
+              navigate(`/session/${sessionId}`);
+            }
             void stop().then((session) => {
-              if (session) {
+              if (session && !sessionId) {
                 navigate(`/session/${session.id}`);
+              }
+              if (session) {
+                void loadSession(session.id);
               }
             });
           }}
@@ -491,14 +498,13 @@ function LiveTranscriptPanel({ segments }: { segments: Segment[] }) {
 function LevelMeter({ label, value }: { label: string; value: number }) {
   const db = levelToDb(value);
   const percent = dbToMeterPercent(db);
+  const level = Math.round(percent);
 
   return (
     <div className="grid gap-2">
       <div className="flex items-center justify-between text-meta">
         <span className="text-ink">{label}</span>
-        <span className="tabular-nums text-ink-2">
-          {db <= -60 ? "-60dB" : `${Math.round(db)}dB`}
-        </span>
+        <span className="tabular-nums text-ink-2">{level}</span>
       </div>
       <div className="h-3 overflow-hidden rounded-chip bg-elevate">
         <div className="h-full bg-[#2F6F6D]" style={{ width: `${percent}%` }} />
@@ -516,7 +522,7 @@ function levelToDb(value: number) {
 }
 
 function dbToMeterPercent(db: number) {
-  return Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+  return Math.max(0, Math.min(100, ((db + 60) / 48) * 100));
 }
 
 function SelectRow<T extends string>({

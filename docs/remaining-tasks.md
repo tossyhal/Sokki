@@ -10,6 +10,7 @@
 - WSL2で実行できる build / typecheck / Rust fmt / xwin check / xwin clippy / Windows-target test build / CPU版NSIS build は通過済み。
 - Windows 11 Home で exe 起動、WebView2表示、単一インスタンス、OnboardingモデルDL、サウンドチェック、マイク/loopback/mix録音、サウンドチェックWAV/録音WAV再生は確認済み。
 - 旧成果物では realtime/batch transcription が `failed to load whisper model: Failed to create a new whisper context.` で失敗した。原因は Whisper job が catalog の `fileName` ではなく model name をファイル名として渡していたこと。修正後の成果物で文字起こし系チェックを再実行する。
+- Windows実機フィードバックを受け、realtime強制確定を5秒に短縮、停止クリック後の詳細画面遷移を先行実行、音声レベルを0-100の圧縮メーター表示、再生速度を0.5x〜3.0xスライダー、SessionDetailのエラー表示を1箇所へ集約した。
 - Windows 実機が必要な native dialog、installer 実行、長時間録音、device lost、import/export、復旧、realtime重複抑制の確認は未完了。
 - `v1.0.0` タグは、Windows 実機で `docs/acceptance.md` の Windows未確認 項目を埋めるまで作成しない。
 
@@ -65,7 +66,7 @@
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 - `chore: verify cpu nsis cross build`
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
-  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,617,138 bytes)。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,612,176 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 - `docs: add readme with build and release instructions`
   - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。

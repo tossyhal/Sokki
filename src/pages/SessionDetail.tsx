@@ -185,7 +185,10 @@ export default function SessionDetail() {
           ) : null}
           {session.status === "error" ? (
             <div className="rounded-card border border-accent bg-accent-soft px-4 py-3 text-body text-ink">
-              セッションでエラーが発生しました。必要に応じて再文字起こしできます。
+              <p>セッションでエラーが発生しました。必要に応じて再文字起こしできます。</p>
+              {session.errorMessage ? (
+                <p className="mt-2 break-words text-meta text-ink-2">{session.errorMessage}</p>
+              ) : null}
             </div>
           ) : null}
 
@@ -489,11 +492,6 @@ function SessionMeta({ session }: { session: Session }) {
         <MetaItem label="欠落" value={String(session.dropCount)} />
         <MetaItem label="ID" value={session.id} />
       </div>
-      {session.errorMessage ? (
-        <div className="rounded-card border border-warn bg-warn-soft px-3 py-2 text-meta text-ink">
-          {session.errorMessage}
-        </div>
-      ) : null}
     </section>
   );
 }
@@ -555,21 +553,29 @@ function AudioPlayer({
               setPlaybackStatus(`音声を読み込めません: ${detail}`);
             }}
           />
-          <div className="flex items-center gap-2">
-            {[1, 1.25, 1.5, 2].map((value) => (
+          <div className="grid gap-2 rounded-card border border-line bg-surface px-3 py-2">
+            <div className="flex items-center justify-between gap-3 text-meta text-ink-2">
+              <span>再生速度</span>
+              <span className="tabular-nums text-ink">{playbackRateLabel(speed)}</span>
+            </div>
+            <div className="grid grid-cols-[1fr_auto] items-center gap-3">
+              <input
+                type="range"
+                min="0.5"
+                max="3"
+                step="0.05"
+                value={speed}
+                onChange={(event) => setSpeed(Number(event.currentTarget.value))}
+                className="w-full accent-[#2F6F6D]"
+              />
               <button
-                key={value}
                 type="button"
-                onClick={() => setSpeed(value)}
-                className={`h-8 rounded-btn border px-3 text-meta font-semibold ${
-                  speed === value
-                    ? "border-ink-2 bg-elevate text-ink"
-                    : "border-line-strong text-ink hover:bg-elevate"
-                }`}
+                onClick={() => setSpeed(1)}
+                className="h-8 rounded-btn border border-line-strong px-3 text-meta font-semibold text-ink hover:bg-elevate"
               >
-                {playbackRateLabel(value)}
+                1x
               </button>
-            ))}
+            </div>
           </div>
           <div className="break-all text-meta text-ink-3">
             {playbackStatus ? `${playbackStatus} / ` : null}

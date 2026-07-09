@@ -2,7 +2,7 @@
 
 日付: 2026-07-09
 仕様の正: `docs/spec.md` §13
-確認対象成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,617,138 bytes)
+確認対象成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,612,176 bytes)
 
 このファイルは、現時点の受け入れ確認状況を記録する。Windows デスクトップ、WebView2、native dialog、マイク、WASAPI loopback、音声再生、インストーラー実行が必要な項目は、Windows 10/11 x64 実機で確認するまで未完了として扱う。手順は `docs/manual-windows-checks.md` に従う。
 
@@ -34,7 +34,7 @@
 - [ ] Windows未確認: ミックス時、片方が無音でももう片方の録音が継続する
 - [ ] Windows未確認: 保存デバイス消失時、候補一覧付きの分かりやすいエラーが出る
 - [x] Windows確認済み: 音声テストのテスト音声を再生確認できる
-- [ ] Windows再確認待ち: サウンドチェックの入力レベル表示をdBFSベースに変更済み。修正後の成果物で体感音量との見え方を確認する。
+- [ ] Windows再確認待ち: サウンドチェックの入力レベル表示を0-100の圧縮メーターへ変更済み。修正後の成果物で体感音量との見え方を確認する。
 - [ ] Windows未確認: 通常負荷でオーディオドロップが発生しない(drop_count=0)
 
 ## 文字起こし
@@ -42,8 +42,8 @@
 - [ ] Windows再確認待ち: 録音中、発話から数秒以内にセグメントが逐次表示される。旧成果物では Whisper model load 失敗によりNG。
 - [ ] Windows未確認: バッチ処理実行中に録音を開始すると、実行中チャンクが中断(または15秒チャンク1回分以内の待ち)され、rtが優先処理される
 - [ ] Windows未確認: バッチ処理は最大15秒チャンクに分割され、キャンセルがチャンク境界で効く
-- [ ] Windows未確認: rt強制確定(8秒)およびbatch強制カットのオーバーラップ部で、同一発話の二重セグメントが発生しない
-- [ ] Windows未確認: 連続発話中でも、最初のセグメントが8秒+推論時間以内に表示される
+- [ ] Windows未確認: rt強制確定(5秒)およびbatch強制カットのオーバーラップ部で、同一発話の二重セグメントが発生しない
+- [ ] Windows未確認: 連続発話中でも、最初のセグメントが5秒+推論時間以内に表示される
 - [ ] Windows再確認待ち: `stop_recording` 後、UIは即詳細画面へ遷移し、残処理は `transcribing` → `done` と遷移する(pending_job_count による判定)。旧成果物では transcription error のため判定保留。
 - [ ] Windows未確認: mp3 インポートが進捗表示付きで完了し、複数ファイル時に失敗ファイルが理由付きで表示される
 - [ ] Windows未確認: `gpu_mode=force_cpu` で必ずCPU動作し、`auto` 失敗時に理由が設定画面に表示される

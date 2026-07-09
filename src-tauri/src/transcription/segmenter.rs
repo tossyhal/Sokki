@@ -29,6 +29,8 @@ struct SpeechBuffer {
     trailing_silence_samples: usize,
 }
 
+const MAX_REALTIME_SPEECH_MS: u64 = 5_000;
+
 impl RealtimeSegmenter {
     pub fn new(sample_rate: u32, vad_threshold_db: i32) -> Self {
         let frame_samples = samples_for_ms(sample_rate, 30).max(1);
@@ -38,7 +40,7 @@ impl RealtimeSegmenter {
             frame_samples,
             preroll_samples: samples_for_ms(sample_rate, 300),
             silence_samples_to_commit: samples_for_ms(sample_rate, 700),
-            max_speech_samples: samples_for_ms(sample_rate, 8_000),
+            max_speech_samples: samples_for_ms(sample_rate, MAX_REALTIME_SPEECH_MS),
             overlap_samples: samples_for_ms(sample_rate, 600),
             min_valid_samples: samples_for_ms(sample_rate, 300),
             cursor_samples: 0,
@@ -230,23 +232,23 @@ mod tests {
     }
 
     #[test]
-    fn force_emits_at_8_seconds_and_overlaps_next_chunk_by_600ms() {
+    fn force_emits_at_5_seconds_and_overlaps_next_chunk_by_600ms() {
         let mut segmenter = RealtimeSegmenter::new(16_000, -40);
 
-        let chunks = segmenter.push(&tone_ms(8_400));
+        let chunks = segmenter.push(&tone_ms(5_400));
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_start_ms, 0);
         assert_eq!(chunks[0].valid_start_ms, 0);
-        assert_eq!(chunks[0].valid_end_ms, 8_000);
-        assert_eq!(chunks[0].audio.len(), samples_for_ms(8_000));
+        assert_eq!(chunks[0].valid_end_ms, 5_000);
+        assert_eq!(chunks[0].audio.len(), samples_for_ms(5_000));
 
         let chunks = segmenter.push(&silence_ms(720));
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].chunk_start_ms, 7_400);
-        assert_eq!(chunks[0].valid_start_ms, 8_000);
-        assert_eq!(chunks[0].valid_end_ms, 8_400);
+        assert_eq!(chunks[0].chunk_start_ms, 4_400);
+        assert_eq!(chunks[0].valid_start_ms, 5_000);
+        assert_eq!(chunks[0].valid_end_ms, 5_400);
     }
 
     #[test]
