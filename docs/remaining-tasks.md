@@ -74,6 +74,10 @@
   - Record 録音中画面に `transcript://segment` 由来のライブセグメント表示を追加。
   - 最新セグメントへの自動スクロール、手動スクロール解除、`最新へ` 復帰、認識中 pending 行を表示。
   - Windows実機での録音中セグメント到着・スクロール挙動は `docs/manual-windows-checks.md` に追記。
+- `docs: record WSL implementation review status`
+  - `pipeline` / `recording` / `sound_check` のロック順、stop/finalize、JobTracker pending 判定、capture error / max duration 自動停止経路を WSL で静的レビュー。
+  - 既存テストは `stop_flushes_active_speech_and_returns_transcribing_when_pending`、`stop_clears_active_flag_when_flush_enqueue_fails`、`device_lost_auto_stop_finalizes_wav_and_marks_session_error`、sound check busy guard 系で主要な race / rollback をカバー。
+  - WSLレビューで修正必須の追加コード差分はなし。実デバイス由来の挙動は Windows 実機確認に残す。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -94,7 +98,7 @@
 
 ### 3. コード品質クリーンアップ / 実機リスク
 
-- `/simplify` または `/code-review` を直近の変更(pipeline/recording/sound_check)にかける。
+- 直近の変更(pipeline/recording/sound_check)の WSL 静的レビューは実施済み。追加の修正必須事項は未検出。
 - 既知の設計メモ: 現時点ではWSLで追加対応できる既知メモなし。Windows実機確認後に発生した事項を追記する。
 
 ## ゲート(各コミット前、WSL2)
