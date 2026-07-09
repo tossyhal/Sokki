@@ -63,6 +63,7 @@ pnpm install
 
 ```bash
 pnpm build
+pnpm typecheck
 
 cd src-tauri
 cargo fmt --all --check

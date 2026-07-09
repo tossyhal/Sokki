@@ -15,6 +15,7 @@ This file records checks that cannot be proven from WSL-only builds/tests. Run t
 These checks can be run from WSL before Windows handoff:
 
 - `pnpm build` for TypeScript/Vite production build.
+- `pnpm typecheck` for TypeScript strict type checking.
 - `cd src-tauri && cargo fmt --all --check`.
 - `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc`.
 - `cd src-tauri && cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
@@ -24,7 +25,7 @@ These checks can be run from WSL before Windows handoff:
 Latest WSL-produced artifact:
 
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe`
-- Size: 25,615,916 bytes
+- Size: 25,618,032 bytes
 - Result: produced successfully from WSL2 cross build on 2026-07-09.
 - Note: this proves packaging only. Launch, installation, WebView2, microphone, WASAPI loopback, mix capture, and asset-protocol playback still require Windows 10/11 x64 manual checks.
 

@@ -11,6 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Node",
+    "types": ["react", "react-dom", "vite/client"],
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,

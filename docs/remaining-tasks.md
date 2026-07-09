@@ -54,7 +54,7 @@
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 - `chore: verify cpu nsis cross build`
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
-  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,615,916 bytes)。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,618,032 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 - `docs: add readme with build and release instructions`
   - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。
@@ -67,6 +67,9 @@
   - `cpal::Stream` を `RecordingManager` 状態に直接保持せず、専有スレッド内で生成・保持・drop する `CaptureStreamHandle` に変更。
   - `unsafe impl Send` を削除し、外側の capture は stop channel と `JoinHandle` のみを保持する。
   - 実マイク / loopback での start/stop は引き続き Windows 実機確認が必要。
+- `chore: add frontend typecheck gate`
+  - `tsconfig.json` の `types` を React / Vite に限定し、不要な implicit `@types/*` 探索による `TS2688` を解消。
+  - `pnpm typecheck` (`tsc --noEmit`) を追加し、既存の ref / action narrowing / nullable selected 型エラーを修正。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -78,7 +81,7 @@
   - Record ページ: モデル選択は usable のみ活性、`recording://limit` 警告表示、サウンドチェック再生UIは実装済み。Windows実機で操作確認が必要。
   - サウンドチェック結果の再生ゲート(§9、`$APPDATA` scope)が実機で通るか。
   - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
-- 完了後、§13 受入チェックリストを `docs/acceptance.md` に記録(コミット62)。
+- Windows実機確認後、§13 受入チェックリストの PENDING_WINDOWS 項目を `docs/acceptance.md` に記録する。
 
 ### 2. M6 残タスク(§15 コミット62のWindows実機確認)
 
@@ -88,8 +91,7 @@
 ### 3. コード品質クリーンアップ / 実機リスク
 
 - `/simplify` または `/code-review` を直近の変更(pipeline/recording/sound_check)にかける。
-- 既知の設計メモ:
-  - `npx tsc --noEmit` は node_modules の implicit @types(babel__core 等)で既存エラーが出る(実害なし)。気になる場合は tsconfig の `types` を明示する。
+- 既知の設計メモ: 現時点ではWSLで追加対応できる既知メモなし。Windows実機確認後に発生した事項を追記する。
 
 ## ゲート(各コミット前、WSL2)
 

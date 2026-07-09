@@ -26,7 +26,7 @@ export default function SessionDetail() {
     cancel,
     delete: deleteSession,
   } = useSessionStore();
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement>(null!);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [segmentError, setSegmentError] = useState<string | null>(null);
   const [currentMs, setCurrentMs] = useState(0);
@@ -512,7 +512,7 @@ function AudioPlayer({
   session,
   onTimeUpdate,
 }: {
-  audioRef: React.RefObject<HTMLAudioElement | null>;
+  audioRef: React.RefObject<HTMLAudioElement>;
   session: Session;
   onTimeUpdate: (timeMs: number) => void;
 }) {

@@ -68,9 +68,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
             errorMessage: status === "error" ? (message ?? session.errorMessage) : null,
           }
         : session;
+    const selected = get().selected;
     set({
       sessions: get().sessions.map(apply),
-      selected: get().selected?.id === id ? apply(get().selected) : get().selected,
+      selected: selected?.id === id ? apply(selected) : selected,
     });
   },
 

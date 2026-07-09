@@ -254,7 +254,7 @@ function ModelManager({
         {models.map((model) => {
           const progress = progressByName[model.name];
           const action = actionByName[model.name];
-          const downloading = action === "download" && progress;
+          const downloading = Boolean(progress);
           const busy = Boolean(action);
           const canVerify = model.downloaded && (!model.verified || model.corrupted || model.origin === "manual");
           return (
