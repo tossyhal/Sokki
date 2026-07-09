@@ -489,19 +489,34 @@ function LiveTranscriptPanel({ segments }: { segments: Segment[] }) {
 }
 
 function LevelMeter({ label, value }: { label: string; value: number }) {
-  const normalized = Math.max(0, Math.min(1, value));
+  const db = levelToDb(value);
+  const percent = dbToMeterPercent(db);
 
   return (
     <div className="grid gap-2">
       <div className="flex items-center justify-between text-meta">
         <span className="text-ink">{label}</span>
-        <span className="tabular-nums text-ink-2">{Math.round(normalized * 100)}</span>
+        <span className="tabular-nums text-ink-2">
+          {db <= -60 ? "-60dB" : `${Math.round(db)}dB`}
+        </span>
       </div>
       <div className="h-3 overflow-hidden rounded-chip bg-elevate">
-        <div className="h-full bg-[#2F6F6D]" style={{ width: `${normalized * 100}%` }} />
+        <div className="h-full bg-[#2F6F6D]" style={{ width: `${percent}%` }} />
       </div>
     </div>
   );
+}
+
+function levelToDb(value: number) {
+  const clamped = Math.max(0, Math.min(1, value));
+  if (clamped <= 0) {
+    return -60;
+  }
+  return Math.max(-60, Math.min(0, 20 * Math.log10(clamped)));
+}
+
+function dbToMeterPercent(db: number) {
+  return Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
 }
 
 function SelectRow<T extends string>({

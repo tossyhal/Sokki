@@ -25,9 +25,44 @@ Windows 引き継ぎ前に WSL で実行できる確認:
 最新の WSL 生成成果物:
 
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe`
-- サイズ: 25,619,629 bytes
+- サイズ: 25,617,138 bytes
 - 結果: 2026-07-09 に WSL2 クロスビルドで生成成功。
 - 注意: これは package 生成の確認に限る。起動、インストール、WebView2、マイク、WASAPI loopback、mix capture、asset protocol 再生は Windows 10/11 x64 実機確認が必要。
+
+## Windows 実機確認ログ
+
+### 2026-07-09 Windows 11 Home / installed exe
+
+確認対象:
+
+- `C:\Users\PC_User\AppData\Local\Sokki\sokki.exe`
+- app data: `C:\Users\PC_User\AppData\Roaming\com.sokki.app`
+- 確認者: ユーザー
+
+確認済み:
+
+- exe 起動: OK。
+- WebView2 表示: OK。真っ白画面にならず、Sokki UI が表示された。
+- 単一インスタンス: OK。2回目起動で新規ウィンドウは増えず、既存ウィンドウが前面化した。
+- Onboarding / モデルDL: OK。`medium-q5_0` 推奨、DL進捗、DL完了後の Settings / Record 選択を確認。
+- サウンドチェック: OK。録音開始との排他、完了後のテストWAV再生を確認。
+- マイク録音: OK。録音WAV再生も確認。
+- システム音声録音: OK。録音WAV再生も確認。
+- マイク + システム音声 mix 録音: OK。録音WAV再生も確認。
+
+NG / 再確認待ち:
+
+- realtime文字起こし: NG。録音中にライブ文字起こしが出ず、停止後に `セッションでエラーが発生しました。必要に応じて再文字起こしできます。` と `failed to load whisper model: Failed to create a new whisper context.` が表示された。再文字起こしも同じ理由で不可。
+- stop後の即時遷移: transcription error のため判定保留。
+- export TXT/SRT/MD: transcript segment が作られなかったため未確認。
+- import: 文字起こしが動いていないため未確認。
+- interrupted復旧: 文字起こしが動いていないため未確認。
+- サウンドチェック入力レベル: 大きめの音量でも入力レベルが一桁に見えた。修正後はメーターを線形パーセントではなくdBFSベース表示に変更したため、見え方を再確認する。
+
+対応:
+
+- Whisper job が catalog の `fileName` ではなく model name をファイル名として渡していたため、`models\medium-q5_0` のような存在しないパスで context 作成していた。修正後の成果物で realtime/batch/retranscribe/import/export を再確認する。
+- 音声レベルメーターは RMS の線形値をそのまま表示していたため、実用音量でも一桁に見えやすかった。表示をdBFSベースに変更し、backendの録音ゲインや保存音声は変更していない。
 
 stop/status 変更について WSL テストで確認すべきこと:
 

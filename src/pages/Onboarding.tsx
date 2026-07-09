@@ -47,8 +47,6 @@ export default function Onboarding() {
   );
   const selectedModelInfo = models.find((model) => model.name === selectedModel);
   const modelReady = Boolean(selectedModelInfo?.usable && !selectedModelInfo.corrupted);
-  const progress = progressByName[selectedModel];
-  const action = actionByName[selectedModel];
   const canContinueFromModel = modelReady;
 
   async function finish(skippedModelDownload = false) {
@@ -96,8 +94,8 @@ export default function Onboarding() {
           loading={modelsLoading}
           selectedModel={selectedModel}
           recommendedModel={recommendedModel}
-          progress={progress}
-          action={action}
+          progressByName={progressByName}
+          actionByName={actionByName}
           modelReady={modelReady}
           canContinue={canContinueFromModel}
           onSelect={setSelectedModel}
@@ -154,8 +152,8 @@ function ModelStep({
   loading,
   selectedModel,
   recommendedModel,
-  progress,
-  action,
+  progressByName,
+  actionByName,
   modelReady,
   canContinue,
   onSelect,
@@ -169,8 +167,8 @@ function ModelStep({
   loading: boolean;
   selectedModel: string;
   recommendedModel: ModelInfo | undefined;
-  progress: { downloadedBytes: number; totalBytes: number | null } | undefined;
-  action: string | undefined;
+  progressByName: Record<string, { downloadedBytes: number; totalBytes: number | null }>;
+  actionByName: Record<string, string>;
   modelReady: boolean;
   canContinue: boolean;
   onSelect: (model: string) => void;
@@ -197,70 +195,90 @@ function ModelStep({
             モデル一覧を読み込み中
           </div>
         ) : null}
-        {models.map((model) => (
-          <button
-            key={model.name}
-            type="button"
-            onClick={() => onSelect(model.name)}
-            className={`grid gap-2 rounded-card border px-4 py-3 text-left ${
-              selectedModel === model.name
-                ? "border-ink bg-surface shadow-card"
-                : "border-line bg-surface hover:bg-surface-2"
-            }`}
-          >
-            <span className="flex flex-wrap items-center gap-2">
-              <span className="text-title text-ink">{model.name}</span>
-              {model.recommended ? (
-                <span className="rounded-chip bg-accent-soft px-2 py-0.5 text-meta font-semibold text-accent">
-                  推奨
-                </span>
+        {models.map((model) => {
+          const progress = progressByName[model.name];
+          const action = actionByName[model.name];
+          const selectedRow = selectedModel === model.name;
+          const downloading = Boolean(progress);
+          const busy = Boolean(action);
+          const status = modelReady && selectedRow ? "選択中・使用可能" : modelStatus(model);
+          return (
+            <article
+              key={model.name}
+              className={`grid gap-3 rounded-card border px-4 py-3 ${
+                selectedRow ? "border-ink bg-surface shadow-card" : "border-line bg-surface"
+              }`}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <button
+                  type="button"
+                  onClick={() => onSelect(model.name)}
+                  className="min-w-0 flex-1 text-left"
+                >
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="text-title text-ink">{model.name}</span>
+                    {model.recommended ? (
+                      <span className="rounded-chip bg-accent-soft px-2 py-0.5 text-meta font-semibold text-accent">
+                        推奨
+                      </span>
+                    ) : null}
+                    <span className="text-meta text-ink-2">{status}</span>
+                  </span>
+                  <span className="mt-1 block text-body text-ink-2">{model.description}</span>
+                  <span className="mt-1 block text-meta text-ink-2">
+                    {model.fileName} / {formatBytes(model.sizeBytes)}
+                  </span>
+                </button>
+                <div className="flex shrink-0 items-center gap-2">
+                  {downloading ? (
+                    <button
+                      type="button"
+                      onClick={() => onCancel(model.name)}
+                      className="h-9 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate disabled:text-ink-3"
+                      disabled={action === "cancel"}
+                    >
+                      {action === "cancel" ? "中断中" : "キャンセル"}
+                    </button>
+                  ) : !model.downloaded ? (
+                    <button
+                      type="button"
+                      onClick={() => onDownload(model.name)}
+                      className="h-9 rounded-btn bg-accent px-3 text-body font-semibold text-white shadow-accent hover:bg-accent-hover disabled:bg-ink-3 disabled:shadow-none"
+                      disabled={busy}
+                    >
+                      {action === "download" ? "DL中" : "DL"}
+                    </button>
+                  ) : (
+                    <span className="text-body text-ink-2">
+                      {model.usable && !model.corrupted ? "使用可能" : "検証が必要"}
+                    </span>
+                  )}
+                </div>
+              </div>
+              {progress ? (
+                <div className="grid gap-1">
+                  <div className="h-2 overflow-hidden rounded-chip bg-elevate">
+                    <div
+                      className="h-full bg-accent"
+                      style={{ width: `${progressPercent(progress)}%` }}
+                    />
+                  </div>
+                  <p className="text-meta text-ink-2">
+                    {formatBytes(progress.downloadedBytes)}
+                    {progress.totalBytes ? ` / ${formatBytes(progress.totalBytes)}` : ""}
+                  </p>
+                </div>
               ) : null}
-              <span className="text-meta text-ink-2">{modelStatus(model)}</span>
-            </span>
-            <span className="text-body text-ink-2">{model.description}</span>
-          </button>
-        ))}
+            </article>
+          );
+        })}
       </div>
 
       {selected ? (
-        <div className="grid gap-3 rounded-card border border-line bg-surface px-4 py-3">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-title text-ink">{selected.name}</p>
-              <p className="text-meta text-ink-2">{formatBytes(selected.sizeBytes)}</p>
-            </div>
-            {action === "download" ? (
-              <button
-                type="button"
-                onClick={() => onCancel(selected.name)}
-                className="h-9 rounded-btn border border-line-strong px-3 text-body text-ink hover:bg-elevate"
-              >
-                キャンセル
-              </button>
-            ) : selected.downloaded ? (
-              <span className="text-body text-ink-2">{modelReady ? "使用可能" : "検証が必要"}</span>
-            ) : (
-              <button
-                type="button"
-                onClick={() => onDownload(selected.name)}
-                className="h-9 rounded-btn bg-accent px-3 text-body font-semibold text-white shadow-accent hover:bg-accent-hover"
-              >
-                ダウンロード
-              </button>
-            )}
-          </div>
-          {progress ? (
-            <div className="grid gap-1">
-              <div className="h-2 overflow-hidden rounded-chip bg-elevate">
-                <div className="h-full bg-accent" style={{ width: `${progressPercent(progress)}%` }} />
-              </div>
-              <p className="text-meta text-ink-2">
-                {formatBytes(progress.downloadedBytes)}
-                {progress.totalBytes ? ` / ${formatBytes(progress.totalBytes)}` : ""}
-              </p>
-            </div>
-          ) : null}
-        </div>
+        <p className="text-meta text-ink-2">
+          選択中: {selected.name}
+          {selected.usable && !selected.corrupted ? "" : "。ダウンロードまたは検証後に次へ進めます。"}
+        </p>
       ) : null}
 
       <div className="flex items-center justify-between gap-3 border-t border-line pt-5">

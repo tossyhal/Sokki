@@ -5,9 +5,10 @@ use std::sync::Arc;
 use whisper_rs::{FullParams, SamplingStrategy};
 
 use crate::db::{Db, Language, NewSegment, Segment};
-use crate::error::{AppError, DB_ERROR, WHISPER_ERROR};
+use crate::error::{AppError, DB_ERROR, MODEL_NOT_FOUND, WHISPER_ERROR};
+use crate::models::model_catalog;
 use crate::settings::{GpuMode, SettingsStore};
-use crate::transcription::context::{model_path, WhisperContextManager};
+use crate::transcription::context::WhisperContextManager;
 use crate::transcription::jobs::{JobKind, TranscribeJob};
 use crate::transcription::worker::{JobProcessResult, JobProcessor};
 
@@ -56,6 +57,10 @@ impl WhisperJobProcessor {
     fn current_gpu_mode(&self) -> Result<GpuMode, AppError> {
         Ok(self.settings_store.read()?.gpu_mode)
     }
+
+    fn model_file_path(&self, model_name: &str) -> Result<PathBuf, AppError> {
+        model_file_path(&self.models_dir, model_name)
+    }
 }
 
 impl JobProcessor for WhisperJobProcessor {
@@ -72,7 +77,7 @@ impl JobProcessor for WhisperJobProcessor {
         let prompt = initial_prompt_from_segments(&previous_segments);
         self.context_manager.ensure_loaded(
             &job.model,
-            &model_path(&self.models_dir, &job.model),
+            &self.model_file_path(&job.model)?,
             self.current_gpu_mode()?,
         )?;
 
@@ -364,6 +369,14 @@ fn whisper_error(message: impl Into<String>) -> AppError {
     AppError::new(WHISPER_ERROR, message)
 }
 
+fn model_file_path(models_dir: &std::path::Path, model_name: &str) -> Result<PathBuf, AppError> {
+    let catalog = model_catalog()
+        .iter()
+        .find(|catalog| catalog.name == model_name)
+        .ok_or_else(|| AppError::new(MODEL_NOT_FOUND, format!("unknown model: {model_name}")))?;
+    Ok(models_dir.join(catalog.file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +491,31 @@ mod tests {
             .expect("settings should update");
 
         assert_eq!(processor.current_gpu_mode().unwrap(), GpuMode::ForceCpu);
+
+        let _ = std::fs::remove_file(settings_path);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn processor_resolves_model_name_to_catalog_file_name() {
+        let settings_path = temp_path("processor_model_file_path", "json");
+        let db_path = temp_path("processor_model_file_path_db", "sqlite");
+        let models_dir = PathBuf::from("C:/Users/example/AppData/Roaming/com.sokki.app/models");
+        let processor = WhisperJobProcessor::new(
+            Arc::new(Db::open(&db_path).expect("db should open")),
+            Arc::new(WhisperContextManager::new()),
+            models_dir.clone(),
+            SettingsStore::new(settings_path.clone()),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        assert_eq!(
+            processor.model_file_path("medium-q5_0").unwrap(),
+            models_dir.join("ggml-medium-q5_0.bin")
+        );
+
+        let error = processor.model_file_path("unknown").unwrap_err();
+        assert_eq!(error.code, MODEL_NOT_FOUND);
 
         let _ = std::fs::remove_file(settings_path);
         let _ = std::fs::remove_file(db_path);
