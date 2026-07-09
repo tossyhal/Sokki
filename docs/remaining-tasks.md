@@ -54,7 +54,7 @@
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 - `chore: verify cpu nsis cross build`
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
-  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,610,394 bytes)。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,608,564 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 - `docs: add readme with build and release instructions`
   - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。
