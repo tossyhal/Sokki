@@ -1,136 +1,136 @@
-# Windows Manual Checks
+# Windows 手動確認
 
-This file records checks that cannot be proven from WSL-only builds/tests. Run these on Windows 10/11 x64 after producing a Windows artifact.
+このファイルは、WSL だけでは証明できない確認項目を記録する。Windows 向け成果物を生成した後、Windows 10/11 x64 実機で実行すること。
 
-## Policy
+## 方針
 
-- WSL may be used for `pnpm build`, Rust formatting, `cargo xwin check`, `cargo xwin clippy`, and Windows-target test builds.
-- WSL may also be used for deterministic Rust/TypeScript logic checks such as JobTracker status transitions, stop flush behavior, worker event payloads, and frontend store updates.
-- Windows-target test builds from WSL prove compilation only; they do not prove the generated `.exe` behavior because the test binaries are not executed in WSL.
-- Do not treat WSL `tauri dev` or Linux Tauri builds as acceptance evidence.
-- Mark each item with the artifact/version tested, Windows version, and result before release.
+- WSL では `pnpm build`、`pnpm typecheck`、Rust format、`cargo xwin check`、`cargo xwin clippy`、Windows-target test build までを確認できる。
+- JobTracker の状態遷移、stop flush、worker event payload、frontend store 更新など、決定的な Rust / TypeScript ロジックは WSL で代替確認してよい。
+- WSL の Windows-target test build はコンパイル確認であり、生成された `.exe` の実行挙動を証明しない。
+- WSL の `tauri dev` や Linux 向け Tauri build を受け入れ証跡にしてはいけない。
+- リリース前に、各項目へ確認した成果物、Windows バージョン、結果を記録する。
 
-## WSL Substitute Checks
+## WSL 代替確認
 
-These checks can be run from WSL before Windows handoff:
+Windows 引き継ぎ前に WSL で実行できる確認:
 
-- `pnpm build` for TypeScript/Vite production build.
-- `pnpm typecheck` for TypeScript strict type checking.
-- `cd src-tauri && cargo fmt --all --check`.
-- `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc`.
-- `cd src-tauri && cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`.
-- `cd src-tauri && cargo xwin test --target x86_64-pc-windows-msvc --all-targets --no-run` to compile Windows-target tests.
-- `pnpm tauri:build:win` to produce the CPU x64 NSIS installer.
+- `pnpm build`: TypeScript/Vite production build。
+- `pnpm typecheck`: TypeScript strict type checking。
+- `cd src-tauri && cargo fmt --all --check`。
+- `cd src-tauri && cargo xwin check --target x86_64-pc-windows-msvc`。
+- `cd src-tauri && cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`。
+- `cd src-tauri && cargo xwin test --target x86_64-pc-windows-msvc --all-targets --no-run`: Windows-target test binary のコンパイル確認。
+- `pnpm tauri:build:win`: CPU x64 NSIS installer の生成確認。
 
-Latest WSL-produced artifact:
+最新の WSL 生成成果物:
 
 - `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe`
-- Size: 25,619,629 bytes
-- Result: produced successfully from WSL2 cross build on 2026-07-09.
-- Note: this proves packaging only. Launch, installation, WebView2, microphone, WASAPI loopback, mix capture, and asset-protocol playback still require Windows 10/11 x64 manual checks.
+- サイズ: 25,619,629 bytes
+- 結果: 2026-07-09 に WSL2 クロスビルドで生成成功。
+- 注意: これは package 生成の確認に限る。起動、インストール、WebView2、マイク、WASAPI loopback、mix capture、asset protocol 再生は Windows 10/11 x64 実機確認が必要。
 
-For stop/status changes, WSL tests should cover:
+stop/status 変更について WSL テストで確認すべきこと:
 
-- `stop_recording` flushes an active realtime segment and returns without waiting for worker completion.
-- The returned session is `transcribing` while pending realtime jobs remain and `done` when none remain.
-- JobTracker preserves `error` instead of overwriting it with `done`.
-- `session://status` updates list/detail UI state through the session store.
+- `stop_recording` はアクティブな realtime segment を flush し、worker 完了を待たずに返る。
+- pending realtime job が残っている間、返却セッションは `transcribing` になり、pending がなければ `done` になる。
+- JobTracker は `error` 状態を `done` で上書きしない。
+- `session://status` は session store を通じて一覧/詳細 UI 状態を更新する。
 
-## Export Dialog
+## エクスポートダイアログ
 
-Prerequisite: at least one session has transcript segments.
+前提: transcript segment を持つセッションが1件以上ある。
 
-- Open a session detail page and confirm the `エクスポート` button is disabled when there are no segments and enabled when segments exist.
-- Click `エクスポート`, choose `TXT`, `SRT`, and `MD` in separate runs, and confirm the native Windows save dialog opens.
-- Save each format to a user-selected folder outside the app data directory.
-- Confirm the exported file is UTF-8 without BOM and uses LF line endings.
-- Confirm TXT joins segment text by newline.
-- Confirm SRT contains numbered cues and `HH:MM:SS,mmm --> HH:MM:SS,mmm` timecodes, then open it in VLC or another SRT-capable player.
-- Confirm MD contains title, created time, duration, model, language, and timestamped transcript lines.
-- After export, click `保存先を開く` and confirm Explorer opens/reveals the exported file.
-- Cancel the native save dialog and confirm no file is written and the dialog remains usable.
-- Try exporting to an unwritable location and confirm an error is shown without crashing the app.
+- セッション詳細を開き、segment がない場合は `エクスポート` ボタンが無効、segment がある場合は有効であることを確認する。
+- `エクスポート` をクリックし、`TXT`、`SRT`、`MD` を別々に選び、Windows native save dialog が開くことを確認する。
+- 各形式を app data 外のユーザー指定フォルダへ保存する。
+- エクスポートファイルが UTF-8(BOMなし) かつ LF 改行であることを確認する。
+- TXT は segment text を改行連結していることを確認する。
+- SRT は連番と `HH:MM:SS,mmm --> HH:MM:SS,mmm` の時刻形式を持ち、VLC 等の SRT 対応プレイヤーで読み込めることを確認する。
+- MD はタイトル、作成日時、長さ、モデル、言語、タイムスタンプ付き本文を含むことを確認する。
+- エクスポート後に `保存先を開く` をクリックし、Explorer が対象ファイルを表示することを確認する。
+- native save dialog をキャンセルし、ファイルが作られず、ダイアログが引き続き利用可能であることを確認する。
+- 書き込み不能な場所へのエクスポートを試し、クラッシュせずエラーが表示されることを確認する。
 
-## Model Management
+## モデル管理
 
-Prerequisite: network access to Hugging Face is available for model download and verification checks.
+前提: Hugging Face へのネットワーク接続があり、モデルDL/検証を確認できる。
 
-- Open Settings and confirm the model list shows all catalog entries with status badges: not downloaded, downloaded, unverified, manual/unverified, or corrupted as applicable.
-- Start a model download and confirm `model://progress` updates the progress bar and downloaded byte text.
-- Cancel an in-progress download and confirm the progress row clears, the UI remains usable, and a later retry starts from the beginning.
-- Complete a model download and confirm the status changes without restarting the app.
-- Delete a downloaded model and confirm the row returns to not downloaded.
-- Place a model file manually in the app models directory, click verify, and confirm a successful SHA-256 match makes it selectable for recording.
-- Attempt verification with a mismatched or truncated model file and confirm the status becomes corrupted and the model is not selectable for recording.
-- Confirm the Settings default model selector only enables usable models and shows unverified app-downloaded models as selectable with an unverified label.
-- Open the Record page and confirm the model selector disables unusable models and the record button remains disabled when the selected model is not usable.
+- Settings を開き、モデル一覧に catalog entries が表示され、状態バッジ(未DL / DL済 / 未検証 / 手動配置・未検証 / 破損)が正しく出ることを確認する。
+- モデルDLを開始し、`model://progress` により進捗バーとダウンロード済み byte 表示が更新されることを確認する。
+- 進行中DLをキャンセルし、進捗表示が消え、UI が継続利用でき、再試行は先頭から始まることを確認する。
+- モデルDLを完了し、アプリ再起動なしで状態が更新されることを確認する。
+- DL済みモデルを削除し、行が未DL状態へ戻ることを確認する。
+- app models directory にモデルファイルを手動配置し、検証をクリックして SHA-256 が一致した場合に録音で選択可能になることを確認する。
+- 不一致または truncate したモデルファイルで検証し、状態が破損になり録音で選択不可になることを確認する。
+- Settings の既定モデル選択は usable なモデルのみを有効化し、未検証 app-downloaded model は未検証ラベル付きで選択可能であることを確認する。
+- Record ページで unusable model が無効化され、選択中モデルが usable でない場合に録音開始ボタンが無効であることを確認する。
 
-## Onboarding
+## オンボーディング
 
-Prerequisite: start with a fresh app data directory or set `onboardingDone` to `false` in `settings.json`.
+前提: app data directory を初期化するか、`settings.json` の `onboardingDone` を `false` にする。
 
-- Launch the app and confirm it redirects to `/onboarding` before the library, record, or settings pages are reachable.
-- Step through welcome, model selection, language selection, and finish.
-- On the model step, confirm `medium-q5_0` is the default/recommended selection.
-- Start a model download and confirm progress bytes update; cancel it and confirm the step remains usable.
-- Skip the model download and confirm onboarding can complete, then confirm Settings can be opened afterward.
-- Complete onboarding with a downloaded usable model and confirm the Library page opens.
-- Restart the app and confirm completed onboarding is not shown again.
-- Set `onboardingDone=false` again and confirm direct navigation to `/record` or `/settings` redirects back to onboarding.
+- アプリ起動時、Library / Record / Settings より先に `/onboarding` へリダイレクトされることを確認する。
+- ようこそ、モデル選択、言語選択、完了の各ステップを進める。
+- モデル選択ステップでは `medium-q5_0` が既定/推奨選択であることを確認する。
+- モデルDLを開始し、progress bytes が更新されること、キャンセル後もステップが利用可能であることを確認する。
+- モデルDLをスキップしても onboarding を完了でき、その後 Settings を開けることを確認する。
+- usable model をDL済みの状態で onboarding を完了し、Library が開くことを確認する。
+- アプリ再起動後、完了済み onboarding が再表示されないことを確認する。
+- 再度 `onboardingDone=false` にし、`/record` や `/settings` へ直接遷移しても onboarding に戻されることを確認する。
 
-## Import Dialog
+## インポートダイアログ
 
-Prerequisite: at least one usable local Whisper model is available.
+前提: usable なローカル Whisper モデルが1つ以上ある。
 
-- Open Library and click `インポート`; confirm the native Windows open dialog appears with audio file filters.
-- Select one valid audio file and confirm an import result row reports success and the Library session list refreshes.
-- Select multiple files where at least one is invalid or unsupported and confirm each failed file is shown with its file name, error code, and reason.
-- Cancel the native open dialog and confirm no import starts and no stale result is shown.
-- Remove or corrupt all usable models and confirm clicking `インポート` shows a settings guidance message instead of opening a broken import flow.
-- Confirm the frontend never asks for a save path or constructs an app-data recording path; imported file paths are only passed to the Rust `import_files` command.
+- Library で `インポート` をクリックし、audio file filter 付きの Windows native open dialog が開くことを確認する。
+- 有効な音声ファイルを1つ選択し、成功の import result row が表示され、Library の session list が更新されることを確認する。
+- 複数ファイルを選び、その中に無効または未対応ファイルを含め、失敗した各ファイルがファイル名・error code・理由付きで表示されることを確認する。
+- native open dialog をキャンセルし、import が開始されず、古い結果が残らないことを確認する。
+- usable model をすべて削除または破損させ、`インポート` クリック時に壊れた import flow ではなく Settings への誘導が出ることを確認する。
+- フロントエンドが save path や app-data recording path を組み立てず、選択したファイルパスだけを Rust の `import_files` command に渡すことを確認する。
 
-## Sound Check And Recording Exclusion
+## サウンドチェックと録音の排他
 
-Prerequisite: at least one usable local Whisper model is available.
+前提: usable なローカル Whisper モデルが1つ以上ある。
 
-- Start a sound check and immediately try to start recording before the sound check finishes.
-- Confirm recording does not start while the sound check is running and the app shows a `SOUND_CHECK_BUSY` style error instead of creating a session.
-- After the sound check finishes, start recording and confirm recording can begin normally.
-- While recording is active, try to start a sound check and confirm it is rejected with an already-recording message.
+- サウンドチェックを開始し、完了前に録音開始を試す。
+- サウンドチェック中は録音が始まらず、session を作成せずに `SOUND_CHECK_BUSY` 相当のエラーが出ることを確認する。
+- サウンドチェック完了後、録音を開始できることを確認する。
+- 録音中にサウンドチェックを開始しようとし、すでに録音中である旨のエラーで拒否されることを確認する。
 
-## Realtime Transcription Pipeline
+## リアルタイム文字起こし
 
-Prerequisite: a usable local Whisper model is available.
+前提: usable なローカル Whisper モデルが1つ以上ある。
 
-- Start a microphone recording and speak continuously for at least 10 seconds.
-- Confirm the Record page live transcript panel appends realtime segments while recording, keeps the latest segment in view by default, and shows the `最新へ` control after manually scrolling away from the bottom.
-- Confirm the session detail transcript shows the live badge and pending row while recording/transcribing.
-- Confirm the first realtime transcript segment appears within 8 seconds plus inference time.
-- Confirm new realtime segments auto-scroll into view without obscuring the playback controls or header actions.
-- Confirm the segment around the 8-second boundary does not duplicate text from the 600ms overlap.
-- Start an import/batch transcription, then start recording while it is pending; confirm realtime recording is prioritized and the batch work resumes after recording stops.
-- Confirm the recorded WAV duration matches the recording length and the realtime transcript timestamps stay within the recorded duration.
-- Stop recording while realtime jobs are still pending and confirm the UI immediately moves to the session detail view without waiting for Whisper completion.
-- Confirm the session status is `transcribing` until pending realtime jobs finish, then changes to `done` through `session://status`.
-- Force or simulate a transcription error and confirm the session remains `error` with a visible message instead of changing to `done`.
-- For a long-running recording, confirm the 10-minute-before-limit warning appears and the 3-hour limit automatically stops recording without leaving a second active recording state.
+- マイク録音を開始し、10秒以上連続して発話する。
+- Record ページのライブ文字起こしパネルに realtime segment が追加され、通常は最新 segment が見える位置まで自動スクロールし、手動で下端から離れると `最新へ` が表示されることを確認する。
+- セッション詳細の transcript に、録音中/文字起こし中の live badge と pending row が表示されることを確認する。
+- 最初の realtime transcript segment が8秒+推論時間以内に表示されることを確認する。
+- 新しい realtime segment が playback controls や header actions を隠さずに表示されることを確認する。
+- 8秒境界付近の segment で、600ms overlap 由来の重複テキストが出ないことを確認する。
+- import/batch transcription の pending 中に録音を開始し、realtime recording が優先され、録音停止後に batch work が再開することを確認する。
+- 録音WAV duration が録音時間と一致し、realtime transcript timestamp が録音 duration 内に収まることを確認する。
+- realtime job が pending の状態で録音停止し、Whisper 完了を待たずに UI が即セッション詳細へ移動することを確認する。
+- pending realtime job が終わるまで session status が `transcribing` で、完了後に `session://status` 経由で `done` へ変わることを確認する。
+- 文字起こしエラーを発生または模擬し、session が `done` に変わらず `error` と可視メッセージを保つことを確認する。
+- 長時間録音で、上限10分前警告が表示され、3時間上限で自動停止し、二重の active recording state が残らないことを確認する。
 
-## Existing Desktop/Device Checks Still Required
+## デスクトップ・デバイス確認
 
-- Launch the generated Windows `.exe`.
-- Launch the generated Windows `.exe` twice and confirm the second launch focuses/restores the existing main window instead of opening another app window.
-- Install and launch from the NSIS installer.
-- Confirm WebView2 loads the UI.
-- Confirm microphone recording.
-- Confirm WASAPI loopback system-audio recording.
-- Confirm mic + system mix recording.
-- During an active microphone recording, unplug or disable the selected input device and confirm recording auto-stops, the WAV remains playable, and the session becomes `error` with a `DEVICE_LOST` message.
-- During an active system-audio or mix recording, disable the selected output device and confirm the same `DEVICE_LOST` auto-stop behavior.
-- Confirm sound-check WAV and recording WAV playback through the WebView asset protocol.
-- Confirm `convertFileSrc` playback paths work after app restart.
-- Confirm `transcribing` sessions interrupted by app shutdown become `interrupted` on next launch and can be retranscribed.
-- Confirm `error` and `interrupted` sessions show visible badges/messages in the library and session detail views.
-- Confirm deleting from both the library card and session detail opens the in-app confirmation dialog and that canceling leaves the session intact.
-- Confirm the record setup view shows a clear warning when the selected source requires a missing input or output device.
-- Confirm the settings screen shows the CPU build note, disables GPU-using mode choices, and updates backend labels after changing GPU mode.
-- Confirm realtime transcript segments still appear once in the session detail view after navigating away and back.
+- 生成された Windows `.exe` を起動する。
+- 生成された Windows `.exe` を2回起動し、2回目は新しいウィンドウを開かず既存 main window を focus/restore することを確認する。
+- NSIS installer からインストールして起動する。
+- WebView2 が UI を読み込むことを確認する。
+- マイク録音を確認する。
+- WASAPI loopback によるシステム音声録音を確認する。
+- マイク + システム音声の mix 録音を確認する。
+- マイク録音中に選択中入力デバイスを抜く/無効化し、録音が自動停止し、WAV が再生可能で、session が `DEVICE_LOST` message 付きの `error` になることを確認する。
+- システム音声または mix 録音中に選択中出力デバイスを無効化し、同じ `DEVICE_LOST` 自動停止挙動を確認する。
+- サウンドチェックWAVと録音WAVが WebView asset protocol 経由で再生できることを確認する。
+- app restart 後も `convertFileSrc` の再生 path が機能することを確認する。
+- `transcribing` session 中にアプリを終了した場合、次回起動時に `interrupted` になり、再文字起こしできることを確認する。
+- `error` / `interrupted` session が Library と SessionDetail で可視 badge/message を表示することを確認する。
+- Library card と SessionDetail の両方から削除を試し、in-app confirmation dialog が開き、キャンセル時は session が残ることを確認する。
+- Record setup view で、選択 source に必要な入力/出力デバイスがない場合に明確な警告が表示されることを確認する。
+- Settings 画面で CPU build note が表示され、GPU 使用 mode choices が無効化され、GPU mode 変更後に backend label が更新されることを確認する。
+- 画面遷移後に戻っても、realtime transcript segment が SessionDetail で一度だけ表示されることを確認する。

@@ -27,7 +27,7 @@ WSL2ではWindows向け成果物をビルドし、生成されたWindows実行�
 - State: Zustand
 - Database: SQLite (`rusqlite`)
 - Audio: `cpal`, WASAPI loopback, `rubato`, `hound`
-- Transcription: whisper.cpp via `whisper-rs`
+- 文字起こし: `whisper-rs` 経由の whisper.cpp
 - Packaging: Tauri bundler / NSIS
 
 ## WSL2 Ubuntu のセットアップ

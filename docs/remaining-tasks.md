@@ -1,6 +1,15 @@
-# 残タスク一覧(2026-07-09 時点)
+# 作業サマリと残タスク(2026-07-09 時点)
 
-作業を中断するにあたり、現状と残タスクをまとめる。実装単位の正は `docs/spec.md` §15 のコミット計画。
+現状と残タスクをまとめる。実装単位の正は `docs/spec.md` §15 のコミット計画。
+
+## 全体サマリ
+
+- M1 / M3 / M4 / M5 の主要実装は完了済み。
+- M2 相当のモデル管理・DL・検証・Onboarding も追加実装済み。
+- M6 は single instance、録音上限、device lost 自動停止、UI polish、CPU版NSISクロスビルド、README/acceptance/manual check 整備まで完了済み。
+- WSL2で実行できる build / typecheck / Rust fmt / xwin check / xwin clippy / Windows-target test build / CPU版NSIS build は通過済み。
+- Windows 実機が必要な録音デバイス、WebView2、asset protocol 再生、native dialog、installer 実行、長時間録音、実マイク/loopback/mix の確認は未完了。
+- `v1.0.0` タグは、Windows 実機で `docs/acceptance.md` の Windows未確認 項目を埋めるまで作成しない。
 
 ## 完了済み(今回のセッション)
 
@@ -89,11 +98,11 @@
   - Record ページ: モデル選択は usable のみ活性、`recording://limit` 警告表示、サウンドチェック再生UI、ライブ文字起こしUIは実装済み。Windows実機で操作確認が必要。
   - サウンドチェック結果の再生ゲート(§9、`$APPDATA` scope)が実機で通るか。
   - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
-- Windows実機確認後、§13 受入チェックリストの PENDING_WINDOWS 項目を `docs/acceptance.md` に記録する。
+- Windows実機確認後、§13 受入チェックリストの Windows未確認 項目を `docs/acceptance.md` に記録する。
 
 ### 2. M6 残タスク(§15 コミット62のWindows実機確認)
 
-- `docs/acceptance.md` の PENDING_WINDOWS 項目を Windows 10/11 x64 実機で確認し、結果を記録する。
+- `docs/acceptance.md` の Windows未確認 項目を Windows 10/11 x64 実機で確認し、結果を記録する。
 - すべての受入項目が通った後に `v1.0.0` タグ付けを検討する。
 
 ### 3. コード品質クリーンアップ / 実機リスク
