@@ -52,6 +52,10 @@
   - Library ヘッダに native open dialog 経由の `import_files` 導線を追加。
   - usable な既定モデル(なければ先頭 usable モデル)を使って import し、`ImportFileResult[]` の成功/失敗をファイル名・エラーコード・理由付きで画面表示する。
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
+- `chore: verify cpu nsis cross build`
+  - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,610,394 bytes)。
+  - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -65,9 +69,8 @@
   - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
 - 完了後、§13 受入チェックリストを `docs/acceptance.md` に記録(コミット62)。
 
-### 2. M6 残タスク(§15 コミット60〜62)
+### 2. M6 残タスク(§15 コミット61〜62)
 
-- コミット60: `pnpm tauri:build:win` による CPU版NSISクロスビルド成功確認。
 - コミット61: README に build/release instructions、手動テスト手順、既知の制限、依存バージョン変更履歴を同期。
 - コミット62: `docs/acceptance.md` に §13 の確認結果を記録し、必要ならタグ付け。
 
