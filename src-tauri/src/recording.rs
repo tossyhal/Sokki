@@ -1,0 +1,1576 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+
+use crate::audio::devices::{self, AudioDevice, AudioDevices};
+use crate::audio::mixer::{MixerSink, SourceLevels};
+use crate::audio::pipeline::{CapturePipeline, CapturePipelineConfig, SharedCaptureErrorHandler};
+use crate::audio::wav::{StreamingWavWriter, WAV_SAMPLE_RATE};
+use crate::bootstrap::RECORDINGS_DIR;
+use crate::db::{Db, Language, Session, SessionStatus, Source};
+use crate::error::{
+    AppError, ALREADY_RECORDING, DB_ERROR, DEVICE_NOT_FOUND, IO_ERROR, NOT_RECORDING,
+};
+use crate::settings::Settings;
+use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+use crate::transcription::segmenter::{RealtimeChunk, RealtimeSegmenter};
+use crate::transcription::worker::{
+    SessionStatusPayload, TranscribeWorkerHandle, TranscribeWorkerState, SESSION_STATUS_EVENT,
+};
+
+pub const RECORDING_LEVEL_EVENT: &str = "recording://level";
+pub const RECORDING_ELAPSED_EVENT: &str = "recording://elapsed";
+pub const RECORDING_DROPS_EVENT: &str = "recording://drops";
+pub const RECORDING_LIMIT_EVENT: &str = "recording://limit";
+pub const MAX_RECORDING_MS: u64 = 3 * 60 * 60 * 1_000;
+pub const RECORDING_LIMIT_WARNING_BEFORE_MS: u64 = 10 * 60 * 1_000;
+const LEVEL_EVENT_INTERVAL: Duration = Duration::from_millis(100);
+const ELAPSED_EVENT_INTERVAL_TICKS: u64 = 5;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StartRecordingRequest {
+    pub source: Source,
+    pub language: Language,
+    pub model: String,
+    pub mic_device: Option<String>,
+    pub loopback_device: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStateSnapshot {
+    pub active: bool,
+    pub session_id: Option<String>,
+    pub paused: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingLevelPayload {
+    pub mic: f32,
+    pub system: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingElapsedPayload {
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingDropsPayload {
+    pub drop_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingLimitPayload {
+    pub kind: RecordingLimitKind,
+    pub elapsed_ms: u64,
+    pub max_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingLimitKind {
+    Warning,
+    MaxReached,
+}
+
+pub trait RecordingEventSink: Send + Sync {
+    fn emit_level(&self, payload: RecordingLevelPayload);
+    fn emit_elapsed(&self, payload: RecordingElapsedPayload);
+    fn emit_drops(&self, payload: RecordingDropsPayload);
+    fn emit_limit(&self, payload: RecordingLimitPayload);
+    fn emit_session_status(&self, _payload: SessionStatusPayload) {}
+}
+
+pub trait RealtimeJobEnqueuer {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError>;
+}
+
+/// Shared services a recording session needs beyond the manager itself.
+pub struct RecordingStartDeps {
+    pub tracker: Arc<JobTracker>,
+    pub enqueuer: Arc<dyn RealtimeJobEnqueuer + Send + Sync>,
+    pub events: Arc<dyn RecordingEventSink>,
+    /// Invoked on fatal capture/write errors; must auto-stop the recording
+    /// from a separate thread (never blocks the calling audio thread).
+    pub on_capture_error: SharedCaptureErrorHandler,
+    /// Invoked once when the recording reaches MAX_RECORDING_MS; must stop
+    /// the recording through the normal stop path from a separate thread.
+    pub on_max_duration: Arc<dyn Fn() + Send + Sync>,
+}
+
+pub struct TauriRecordingEventSink {
+    app: tauri::AppHandle,
+}
+
+pub struct RecordingManager {
+    active: Arc<AtomicBool>,
+    id_counter: AtomicU64,
+    state: Mutex<Option<ActiveRecording>>,
+}
+
+struct ActiveRecording {
+    session_id: String,
+    timing: Arc<Mutex<RecordingTiming>>,
+    io: Arc<Mutex<RecordingIo>>,
+    pipeline: Option<CapturePipeline>,
+    levels: Arc<Mutex<RecordingLevelPayload>>,
+    drop_count: Arc<AtomicU64>,
+    event_stop_tx: mpsc::Sender<()>,
+    event_thread: Option<JoinHandle<()>>,
+}
+
+/// Mutable per-session audio state shared between the mixer thread (via
+/// `RecordingMixerSink`) and command handlers. Held behind its own mutex so
+/// the mixer thread never needs the `RecordingManager` state lock, which the
+/// stop path holds while joining the mixer thread.
+struct RecordingIo {
+    session_id: String,
+    language: Language,
+    model: String,
+    writer: Option<StreamingWavWriter>,
+    segmenter: RealtimeSegmenter,
+    write_error: Option<AppError>,
+}
+
+impl RecordingIo {
+    fn record_frame(
+        &mut self,
+        samples: &[f32],
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+    ) -> Result<(), AppError> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| AppError::new(IO_ERROR, "wav writer is already closed"))?
+            .write_frame(samples)?;
+
+        for chunk in self.segmenter.push(samples) {
+            enqueue_realtime_chunk(self, chunk, tracker, enqueuer)?;
+        }
+        Ok(())
+    }
+}
+
+/// Feeds mixed frames from the mixer thread into the recording session.
+/// A fatal write error is recorded once and reported through the shared
+/// capture error handler, which auto-stops the recording from its own thread.
+struct RecordingMixerSink {
+    io: Arc<Mutex<RecordingIo>>,
+    tracker: Arc<JobTracker>,
+    enqueuer: Arc<dyn RealtimeJobEnqueuer + Send + Sync>,
+    on_fatal: SharedCaptureErrorHandler,
+}
+
+impl MixerSink for RecordingMixerSink {
+    fn write_frame(&mut self, frame: &[f32]) {
+        let mut io = self
+            .io
+            .lock()
+            .expect("recording io mutex should not be poisoned");
+        if io.write_error.is_some() {
+            return;
+        }
+        if let Err(error) = io.record_frame(frame, &self.tracker, self.enqueuer.as_ref()) {
+            io.write_error = Some(error.clone());
+            drop(io);
+            (self.on_fatal)(error);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecordingTiming {
+    started_at: Instant,
+    paused_at: Option<Instant>,
+    paused_total: Duration,
+}
+
+impl RecordingManager {
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(false)),
+            id_counter: AtomicU64::new(0),
+            state: Mutex::new(None),
+        }
+    }
+
+    pub fn start(
+        &self,
+        db: &Db,
+        data_dir: &Path,
+        settings: &Settings,
+        request: StartRecordingRequest,
+        deps: RecordingStartDeps,
+    ) -> Result<String, AppError> {
+        let audio_devices = devices::list_audio_devices()?;
+        self.start_with_devices(db, data_dir, settings, request, &audio_devices, deps, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_devices(
+        &self,
+        db: &Db,
+        data_dir: &Path,
+        settings: &Settings,
+        request: StartRecordingRequest,
+        audio_devices: &AudioDevices,
+        deps: RecordingStartDeps,
+        with_capture_pipeline: bool,
+    ) -> Result<String, AppError> {
+        if request.source == Source::Import {
+            return Err(AppError::new(
+                IO_ERROR,
+                "import source cannot be used for recording",
+            ));
+        }
+        validate_requested_devices(&request, audio_devices)?;
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        if state.is_some() {
+            return Err(AppError::new(ALREADY_RECORDING, "recording already active"));
+        }
+
+        let session_id = self.next_session_id();
+        let wav_path = recording_wav_path(data_dir, &session_id);
+        let writer = StreamingWavWriter::create(&wav_path)?;
+
+        let io = Arc::new(Mutex::new(RecordingIo {
+            session_id: session_id.clone(),
+            language: request.language,
+            model: request.model.clone(),
+            writer: Some(writer),
+            segmenter: RealtimeSegmenter::new(WAV_SAMPLE_RATE, settings.vad_threshold_db),
+            write_error: None,
+        }));
+        let levels = Arc::new(Mutex::new(RecordingLevelPayload {
+            mic: 0.0,
+            system: 0.0,
+        }));
+        let drop_count = Arc::new(AtomicU64::new(0));
+
+        let pipeline = if with_capture_pipeline {
+            let sink = RecordingMixerSink {
+                io: Arc::clone(&io),
+                tracker: Arc::clone(&deps.tracker),
+                enqueuer: Arc::clone(&deps.enqueuer),
+                on_fatal: Arc::clone(&deps.on_capture_error),
+            };
+            let level_slot = Arc::clone(&levels);
+            let pipeline = CapturePipeline::start(
+                CapturePipelineConfig {
+                    source: request.source,
+                    mic_device: request.mic_device.clone(),
+                    loopback_device: request.loopback_device.clone(),
+                    mic_gain: settings.mic_gain,
+                    system_gain: settings.system_gain,
+                },
+                Arc::clone(&drop_count),
+                sink,
+                move |source_levels, _peaks| {
+                    let mut current = level_slot
+                        .lock()
+                        .expect("recording levels mutex should not be poisoned");
+                    *current = RecordingLevelPayload {
+                        mic: source_levels.mic,
+                        system: source_levels.system,
+                    };
+                },
+                Arc::clone(&deps.on_capture_error),
+            );
+            match pipeline {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&wav_path);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        let now_ms = unix_time_ms() as i64;
+        let session = Session {
+            id: session_id.clone(),
+            title: format!("Recording {session_id}"),
+            created_at: now_ms,
+            duration_ms: 0,
+            audio_path: Some(wav_path.display().to_string()),
+            source: request.source,
+            language: request.language,
+            model: request.model,
+            status: SessionStatus::Recording,
+            error_message: None,
+            drop_count: 0,
+        };
+        if let Err(error) = db.insert_session(&session).map_err(db_error) {
+            if let Some(pipeline) = pipeline {
+                pipeline.stop();
+            }
+            let _ = std::fs::remove_file(&wav_path);
+            return Err(error);
+        }
+
+        let timing = Arc::new(Mutex::new(RecordingTiming::new()));
+        let (event_stop_tx, event_stop_rx) = mpsc::channel();
+        let event_thread = spawn_event_thread(
+            Arc::clone(&timing),
+            Arc::clone(&levels),
+            Arc::clone(&drop_count),
+            deps.events,
+            deps.on_max_duration,
+            event_stop_rx,
+        );
+
+        *state = Some(ActiveRecording {
+            session_id: session_id.clone(),
+            timing,
+            io,
+            pipeline,
+            levels,
+            drop_count,
+            event_stop_tx,
+            event_thread: Some(event_thread),
+        });
+        self.active.store(true, Ordering::SeqCst);
+
+        Ok(session_id)
+    }
+
+    pub fn pause(&self) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let active = state
+            .as_mut()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+        if let Some(pipeline) = &active.pipeline {
+            pipeline.pause();
+        }
+        let mut timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
+        if timing.paused_at.is_none() {
+            timing.paused_at = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    pub fn resume(&self) -> Result<(), AppError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let active = state
+            .as_mut()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+        if let Some(pipeline) = &active.pipeline {
+            pipeline.resume();
+        }
+        let mut timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
+        if let Some(paused_at) = timing.paused_at.take() {
+            timing.paused_total += paused_at.elapsed();
+        }
+        Ok(())
+    }
+
+    pub fn stop(
+        &self,
+        db: &Db,
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+    ) -> Result<Session, AppError> {
+        let mut active = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned")
+            .take()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+
+        // §4.1: stop capture/mixer first; joining the mixer thread flushes any
+        // buffered audio into the WAV/segmenter before we finalize below.
+        if let Some(pipeline) = active.pipeline.take() {
+            pipeline.stop();
+        }
+        let _ = active.event_stop_tx.send(());
+        if let Some(event_thread) = active.event_thread.take() {
+            let _ = event_thread.join();
+        }
+
+        let mut io = active
+            .io
+            .lock()
+            .expect("recording io mutex should not be poisoned");
+        let mut stop_error = io.write_error.take();
+
+        if let Some(chunk) = io.segmenter.flush() {
+            if let Err(error) = enqueue_realtime_chunk(&io, chunk, tracker, enqueuer) {
+                stop_error.get_or_insert(error);
+            }
+        }
+
+        let duration_ms = match io.writer.take() {
+            Some(writer) => match writer.finalize() {
+                Ok(duration_ms) => Some(duration_ms as i64),
+                Err(error) => {
+                    stop_error.get_or_insert(error);
+                    None
+                }
+            },
+            None => None,
+        };
+        drop(io);
+
+        if let Some(duration_ms) = duration_ms {
+            let drop_count = active.drop_count.load(Ordering::Relaxed) as i64;
+            if let Err(error) =
+                db.update_session_duration(&active.session_id, duration_ms, drop_count)
+            {
+                stop_error.get_or_insert(db_error(error));
+            }
+        }
+
+        self.active.store(false, Ordering::SeqCst);
+
+        if let Some(error) = stop_error {
+            let message = format!("{}: {}", error.code, error.message);
+            db.update_session_status(&active.session_id, SessionStatus::Error, Some(&message))
+                .map_err(db_error)?;
+        }
+        tracker.recording_stopped(db, &active.session_id)?;
+        db.get_session(&active.session_id)
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::new(DB_ERROR, "recording session not found after stop"))
+    }
+
+    pub fn stop_with_error(
+        &self,
+        db: &Db,
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+        error: AppError,
+        events: Arc<dyn RecordingEventSink>,
+    ) -> Result<Option<Session>, AppError> {
+        let Some(mut active) = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned")
+            .take()
+        else {
+            return Ok(None);
+        };
+
+        let session_id = active.session_id.clone();
+        let mut error_message = format!("{}: {}", error.code, error.message);
+
+        if let Some(pipeline) = active.pipeline.take() {
+            pipeline.stop();
+        }
+        let _ = active.event_stop_tx.send(());
+        if let Some(event_thread) = active.event_thread.take() {
+            let _ = event_thread.join();
+        }
+        self.active.store(false, Ordering::SeqCst);
+
+        let mut io = active
+            .io
+            .lock()
+            .expect("recording io mutex should not be poisoned");
+        if let Some(write_error) = io.write_error.take() {
+            if write_error != error {
+                error_message.push_str("; wav write failed: ");
+                error_message.push_str(&write_error.message);
+            }
+        }
+        if let Some(chunk) = io.segmenter.flush() {
+            if let Err(flush_error) = enqueue_realtime_chunk(&io, chunk, tracker, enqueuer) {
+                error_message.push_str("; realtime flush failed: ");
+                error_message.push_str(&flush_error.message);
+            }
+        }
+
+        let drop_count = active.drop_count.load(Ordering::Relaxed) as i64;
+        match io.writer.take() {
+            Some(writer) => match writer.finalize() {
+                Ok(duration_ms) => {
+                    if let Err(duration_error) =
+                        db.update_session_duration(&session_id, duration_ms as i64, drop_count)
+                    {
+                        error_message.push_str("; duration update failed: ");
+                        error_message.push_str(&duration_error.to_string());
+                    }
+                }
+                Err(finalize_error) => {
+                    error_message.push_str("; wav finalize failed: ");
+                    error_message.push_str(&finalize_error.message);
+                }
+            },
+            None => {
+                error_message.push_str("; wav writer is already closed");
+            }
+        }
+
+        db.update_session_status(&session_id, SessionStatus::Error, Some(&error_message))
+            .map_err(db_error)?;
+        tracker.recording_stopped(db, &session_id)?;
+
+        let session = db
+            .get_session(&session_id)
+            .map_err(db_error)?
+            .ok_or_else(|| AppError::new(DB_ERROR, "recording session not found after stop"))?;
+        events.emit_session_status(SessionStatusPayload {
+            session_id,
+            status: session.status,
+            message: session.error_message.clone(),
+        });
+
+        Ok(Some(session))
+    }
+
+    pub fn state(&self) -> Result<RecordingStateSnapshot, AppError> {
+        let state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let Some(active) = state.as_ref() else {
+            return Ok(RecordingStateSnapshot {
+                active: false,
+                session_id: None,
+                paused: false,
+                elapsed_ms: 0,
+            });
+        };
+        let timing = active
+            .timing
+            .lock()
+            .expect("recording timing mutex should not be poisoned");
+
+        Ok(RecordingStateSnapshot {
+            active: true,
+            session_id: Some(active.session_id.clone()),
+            paused: timing.paused_at.is_some(),
+            elapsed_ms: timing.elapsed().as_millis() as u64,
+        })
+    }
+
+    pub fn recording_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn recording_active_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active)
+    }
+
+    pub fn record_mixed_samples(
+        &self,
+        samples: &[f32],
+        tracker: &JobTracker,
+        enqueuer: &dyn RealtimeJobEnqueuer,
+    ) -> Result<(), AppError> {
+        let io = {
+            let state = self
+                .state
+                .lock()
+                .expect("recording state mutex should not be poisoned");
+            let active = state
+                .as_ref()
+                .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+            Arc::clone(&active.io)
+        };
+        let mut io = io
+            .lock()
+            .expect("recording io mutex should not be poisoned");
+        io.record_frame(samples, tracker, enqueuer)
+    }
+
+    pub fn update_levels(&self, levels: SourceLevels) -> Result<(), AppError> {
+        let state = self
+            .state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let active = state
+            .as_ref()
+            .ok_or_else(|| AppError::new(NOT_RECORDING, "recording is not active"))?;
+        let mut current = active
+            .levels
+            .lock()
+            .expect("recording levels mutex should not be poisoned");
+        *current = RecordingLevelPayload {
+            mic: levels.mic,
+            system: levels.system,
+        };
+        Ok(())
+    }
+
+    fn next_session_id(&self) -> String {
+        let counter = self.id_counter.fetch_add(1, Ordering::Relaxed);
+        format!("rec-{}-{counter}", unix_time_ms())
+    }
+}
+
+impl RealtimeJobEnqueuer for TranscribeWorkerHandle {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_rt(job)
+    }
+}
+
+impl RealtimeJobEnqueuer for TranscribeWorkerState {
+    fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+        self.enqueue_rt(job)
+    }
+}
+
+impl Default for RecordingManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TauriRecordingEventSink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl RecordingEventSink for TauriRecordingEventSink {
+    fn emit_level(&self, payload: RecordingLevelPayload) {
+        let _ = self.app.emit(RECORDING_LEVEL_EVENT, payload);
+    }
+
+    fn emit_elapsed(&self, payload: RecordingElapsedPayload) {
+        let _ = self.app.emit(RECORDING_ELAPSED_EVENT, payload);
+    }
+
+    fn emit_drops(&self, payload: RecordingDropsPayload) {
+        let _ = self.app.emit(RECORDING_DROPS_EVENT, payload);
+    }
+
+    fn emit_limit(&self, payload: RecordingLimitPayload) {
+        let _ = self.app.emit(RECORDING_LIMIT_EVENT, payload);
+    }
+
+    fn emit_session_status(&self, payload: SessionStatusPayload) {
+        let _ = self.app.emit(SESSION_STATUS_EVENT, payload);
+    }
+}
+
+impl RecordingTiming {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            paused_at: None,
+            paused_total: Duration::ZERO,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        let paused = self
+            .paused_at
+            .map(|paused_at| paused_at.elapsed())
+            .unwrap_or(Duration::ZERO);
+        self.started_at
+            .elapsed()
+            .saturating_sub(self.paused_total)
+            .saturating_sub(paused)
+    }
+}
+
+fn spawn_event_thread(
+    timing: Arc<Mutex<RecordingTiming>>,
+    levels: Arc<Mutex<RecordingLevelPayload>>,
+    drop_count: Arc<AtomicU64>,
+    events: Arc<dyn RecordingEventSink>,
+    on_max_duration: Arc<dyn Fn() + Send + Sync>,
+    stop_rx: mpsc::Receiver<()>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut tick_count = 0;
+        let mut last_drop_count = 0;
+        let mut limit_state = RecordingLimitState::default();
+        loop {
+            match stop_rx.recv_timeout(LEVEL_EVENT_INTERVAL) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            tick_count += 1;
+            let timing = timing
+                .lock()
+                .expect("recording timing mutex should not be poisoned");
+            let paused = timing.paused_at.is_some();
+            let elapsed_ms = timing.elapsed().as_millis() as u64;
+            drop(timing);
+
+            if !paused {
+                let level = *levels
+                    .lock()
+                    .expect("recording levels mutex should not be poisoned");
+                events.emit_level(level);
+            }
+
+            if tick_count % ELAPSED_EVENT_INTERVAL_TICKS == 0 {
+                events.emit_elapsed(RecordingElapsedPayload { elapsed_ms });
+            }
+
+            if let Some(payload) = limit_state.next_payload(elapsed_ms) {
+                let max_reached = payload.kind == RecordingLimitKind::MaxReached;
+                events.emit_limit(payload);
+                if max_reached {
+                    on_max_duration();
+                }
+            }
+
+            let current_drop_count = drop_count.load(Ordering::Relaxed);
+            if current_drop_count > last_drop_count {
+                last_drop_count = current_drop_count;
+                events.emit_drops(RecordingDropsPayload {
+                    drop_count: current_drop_count,
+                });
+            }
+        }
+    })
+}
+
+#[derive(Default)]
+struct RecordingLimitState {
+    warning_sent: bool,
+    max_sent: bool,
+}
+
+impl RecordingLimitState {
+    fn next_payload(&mut self, elapsed_ms: u64) -> Option<RecordingLimitPayload> {
+        if !self.max_sent && elapsed_ms >= MAX_RECORDING_MS {
+            self.max_sent = true;
+            self.warning_sent = true;
+            return Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms,
+                max_ms: MAX_RECORDING_MS,
+            });
+        }
+
+        if !self.warning_sent
+            && elapsed_ms >= MAX_RECORDING_MS.saturating_sub(RECORDING_LIMIT_WARNING_BEFORE_MS)
+        {
+            self.warning_sent = true;
+            return Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::Warning,
+                elapsed_ms,
+                max_ms: MAX_RECORDING_MS,
+            });
+        }
+
+        None
+    }
+}
+
+fn recording_wav_path(data_dir: &Path, session_id: &str) -> PathBuf {
+    data_dir
+        .join(RECORDINGS_DIR)
+        .join(format!("{session_id}.wav"))
+}
+
+fn enqueue_realtime_chunk(
+    io: &RecordingIo,
+    chunk: RealtimeChunk,
+    tracker: &JobTracker,
+    enqueuer: &dyn RealtimeJobEnqueuer,
+) -> Result<(), AppError> {
+    let canceled = tracker.enqueue(&io.session_id);
+    let job = TranscribeJob {
+        session_id: io.session_id.clone(),
+        kind: JobKind::Rt,
+        audio: chunk.audio,
+        chunk_start_ms: chunk.chunk_start_ms,
+        valid_start_ms: chunk.valid_start_ms,
+        valid_end_ms: chunk.valid_end_ms,
+        session_duration_ms: chunk.valid_end_ms,
+        language: io.language,
+        model: io.model.clone(),
+        canceled,
+    };
+
+    if let Err(error) = enqueuer.enqueue_rt_job(job) {
+        tracker.discard_enqueued(&io.session_id);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
+}
+
+fn db_error(error: rusqlite::Error) -> AppError {
+    AppError::new(DB_ERROR, format!("database error: {error}"))
+}
+
+fn validate_requested_devices(
+    request: &StartRecordingRequest,
+    audio_devices: &AudioDevices,
+) -> Result<(), AppError> {
+    match request.source {
+        Source::Mic => validate_input_device(request.mic_device.as_deref(), audio_devices),
+        Source::System => validate_output_device(request.loopback_device.as_deref(), audio_devices),
+        Source::Mix => {
+            validate_input_device(request.mic_device.as_deref(), audio_devices)?;
+            validate_output_device(request.loopback_device.as_deref(), audio_devices)
+        }
+        Source::Import => Ok(()),
+    }
+}
+
+fn validate_input_device(
+    requested: Option<&str>,
+    audio_devices: &AudioDevices,
+) -> Result<(), AppError> {
+    validate_device("input", requested, &audio_devices.inputs)
+}
+
+fn validate_output_device(
+    requested: Option<&str>,
+    audio_devices: &AudioDevices,
+) -> Result<(), AppError> {
+    validate_device("output", requested, &audio_devices.outputs)
+}
+
+fn validate_device(
+    kind: &str,
+    requested: Option<&str>,
+    devices: &[AudioDevice],
+) -> Result<(), AppError> {
+    if devices.is_empty() {
+        return Err(AppError::new(
+            DEVICE_NOT_FOUND,
+            format!("no {kind} audio device is available"),
+        ));
+    }
+
+    if let Some(requested) = requested {
+        let found = devices.iter().any(|device| device.id == requested);
+        if !found {
+            return Err(AppError::new(
+                DEVICE_NOT_FOUND,
+                format!("{kind} audio device not found: {requested}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Db, Language, SessionStatus, Source};
+    use crate::transcription::jobs::{JobKind, JobTracker, TranscribeJob};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn start_recording_inserts_recording_session_and_sets_active() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("start_recording_inserts_recording_session_and_sets_active");
+        let manager = RecordingManager::new();
+
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                StartRecordingRequest {
+                    source: Source::Mic,
+                    language: Language::Ja,
+                    model: "medium-q5_0".to_string(),
+                    mic_device: None,
+                    loopback_device: None,
+                },
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        let session = db.get_session(&session_id).unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Recording);
+        assert_eq!(session.source, Source::Mic);
+        assert!(session.audio_path.unwrap().ends_with(".wav"));
+        assert!(manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_start_while_recording() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("rejects_start_while_recording");
+        let manager = RecordingManager::new();
+        let request = StartRecordingRequest {
+            source: Source::Mic,
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            mic_device: None,
+            loopback_device: None,
+        };
+
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                request.clone(),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+        let error = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                request,
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, crate::error::ALREADY_RECORDING);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn pause_resume_updates_recording_state() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("pause_resume_updates_recording_state");
+        let manager = RecordingManager::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        manager.pause().unwrap();
+        let paused = manager.state().unwrap();
+        assert_eq!(paused.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(paused.paused);
+
+        manager.resume().unwrap();
+        assert!(!manager.state().unwrap().paused);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stop_finalizes_wav_and_marks_session_done() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("stop_finalizes_wav_and_marks_session_done");
+        let manager = RecordingManager::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        let session = stop_without_pending(&manager, &db);
+
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.status, SessionStatus::Done);
+        assert!(!manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn validates_source_specific_devices_before_starting() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("validates_source_specific_devices_before_starting");
+        let manager = RecordingManager::new();
+
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mix),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        assert!(manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_requested_device() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("rejects_missing_requested_device");
+        let manager = RecordingManager::new();
+        let request = StartRecordingRequest {
+            mic_device: Some("missing mic".to_string()),
+            ..sample_request(Source::Mic)
+        };
+
+        let error = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                request,
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, crate::error::DEVICE_NOT_FOUND);
+        assert!(!manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_source_when_required_device_kind_is_unavailable() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("rejects_source_when_required_device_kind_is_unavailable");
+        let manager = RecordingManager::new();
+        let devices = AudioDevices {
+            inputs: sample_devices().inputs,
+            outputs: vec![],
+        };
+
+        let error = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::System),
+                &devices,
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, crate::error::DEVICE_NOT_FOUND);
+        assert!(!manager.recording_active());
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn emits_recording_level_and_elapsed_events_while_active() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("emits_recording_level_and_elapsed_events_while_active");
+        let manager = RecordingManager::new();
+        let events = Arc::new(TestRecordingEventSink::default());
+
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(events.clone()),
+                false,
+            )
+            .unwrap();
+        manager
+            .update_levels(SourceLevels {
+                mic: 0.25,
+                system: 0.0,
+            })
+            .unwrap();
+
+        wait_until(StdDuration::from_secs(2), || {
+            events
+                .levels
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|level| level.mic == 0.25)
+                && !events.elapsed.lock().unwrap().is_empty()
+        });
+
+        assert!(events
+            .levels
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|level| level.mic == 0.25));
+        assert!(!events.elapsed.lock().unwrap().is_empty());
+        stop_without_pending(&manager, &db);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn record_mixed_samples_writes_wav_and_enqueues_realtime_jobs() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("record_mixed_samples_writes_wav_and_enqueues_realtime_jobs");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(900), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&silence_ms(720), &tracker, &enqueuer)
+            .unwrap();
+
+        let jobs = enqueuer.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.session_id, session_id);
+        assert_eq!(job.kind, JobKind::Rt);
+        assert_eq!(job.chunk_start_ms, 0);
+        assert_eq!(job.valid_start_ms, 300);
+        assert_eq!(job.valid_end_ms, 1_200);
+        assert_eq!(job.session_duration_ms, 1_200);
+        assert_eq!(job.language, Language::Ja);
+        assert_eq!(job.model, "medium-q5_0");
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Recording
+        );
+        drop(jobs);
+
+        let session = manager.stop(&db, &tracker, &enqueuer).unwrap();
+        assert_eq!(session.status, SessionStatus::Transcribing);
+        assert!(session.duration_ms >= 1_900);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn recording_active_flag_is_shared_for_worker_preemption() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("recording_active_flag_is_shared_for_worker_preemption");
+        let manager = RecordingManager::new();
+        let active = manager.recording_active_flag();
+
+        assert!(!active.load(Ordering::SeqCst));
+        manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        assert!(active.load(Ordering::SeqCst));
+        stop_without_pending(&manager, &db);
+        assert!(!active.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn record_mixed_samples_rolls_back_pending_when_rt_enqueue_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir =
+            temp_data_dir("record_mixed_samples_rolls_back_pending_when_rt_enqueue_fails");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(
+                &[silence_ms(300), tone_ms(900), silence_ms(720)].concat(),
+                &tracker,
+                &FailingRealtimeJobEnqueuer,
+            )
+            .unwrap_err();
+
+        assert_eq!(tracker.pending_count(&session_id), 0);
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Recording
+        );
+        stop_without_pending(&manager, &db);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stop_flushes_active_speech_and_returns_transcribing_when_pending() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir =
+            temp_data_dir("stop_flushes_active_speech_and_returns_transcribing_when_pending");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &enqueuer)
+            .unwrap();
+
+        let session = manager.stop(&db, &tracker, &enqueuer).unwrap();
+
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.status, SessionStatus::Transcribing);
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        let jobs = enqueuer.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].chunk_start_ms, 0);
+        assert_eq!(jobs[0].valid_start_ms, 300);
+        assert_eq!(jobs[0].valid_end_ms, 800);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn stop_clears_active_flag_when_flush_enqueue_fails() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("stop_clears_active_flag_when_flush_enqueue_fails");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(Arc::new(TestRecordingEventSink::default())),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(
+                &silence_ms(300),
+                &tracker,
+                &TestRealtimeJobEnqueuer::default(),
+            )
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &TestRealtimeJobEnqueuer::default())
+            .unwrap();
+
+        let session = manager
+            .stop(&db, &tracker, &FailingRealtimeJobEnqueuer)
+            .unwrap();
+
+        assert_eq!(session.status, SessionStatus::Error);
+        assert!(session
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("rt worker unavailable"));
+        assert!(session.duration_ms >= 800, "wav should still be finalized");
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 0);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn device_lost_auto_stop_finalizes_wav_and_marks_session_error() {
+        let db = Db::open_in_memory().unwrap();
+        let data_dir = temp_data_dir("device_lost_auto_stop_finalizes_wav_and_marks_session_error");
+        let manager = RecordingManager::new();
+        let tracker = JobTracker::new();
+        let enqueuer = TestRealtimeJobEnqueuer::default();
+        let events = Arc::new(TestRecordingEventSink::default());
+        let session_id = manager
+            .start_with_devices(
+                &db,
+                &data_dir,
+                &Settings::default(),
+                sample_request(Source::Mic),
+                &sample_devices(),
+                test_deps(events.clone()),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .record_mixed_samples(&silence_ms(300), &tracker, &enqueuer)
+            .unwrap();
+        manager
+            .record_mixed_samples(&tone_ms(500), &tracker, &enqueuer)
+            .unwrap();
+
+        let session = manager
+            .stop_with_error(
+                &db,
+                &tracker,
+                &enqueuer,
+                AppError::new(crate::error::DEVICE_LOST, "input device disconnected"),
+                events.clone(),
+            )
+            .unwrap()
+            .expect("active recording should be stopped");
+
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.status, SessionStatus::Error);
+        assert_eq!(
+            session.error_message.as_deref(),
+            Some("DEVICE_LOST: input device disconnected")
+        );
+        assert!(session.duration_ms >= 800);
+        assert!(!manager.recording_active());
+        assert_eq!(tracker.pending_count(&session_id), 1);
+        assert_eq!(enqueuer.jobs.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            tracker.finish(&db, &session_id, false).unwrap(),
+            crate::transcription::jobs::JobCompletion::Done {
+                session_id: session_id.clone()
+            }
+        );
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().status,
+            SessionStatus::Error
+        );
+        assert!(events
+            .statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|status| status.session_id == session_id
+                && status.status == SessionStatus::Error
+                && status.message.as_deref() == Some("DEVICE_LOST: input device disconnected")));
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn recording_limit_state_warns_once_then_reports_max_once() {
+        let mut state = RecordingLimitState::default();
+
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS - 1),
+            None
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::Warning,
+                elapsed_ms: MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS - RECORDING_LIMIT_WARNING_BEFORE_MS + 1),
+            None
+        );
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms: MAX_RECORDING_MS,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(state.next_payload(MAX_RECORDING_MS + 1), None);
+    }
+
+    #[test]
+    fn recording_limit_state_reports_max_without_prior_warning() {
+        let mut state = RecordingLimitState::default();
+
+        assert_eq!(
+            state.next_payload(MAX_RECORDING_MS + 1),
+            Some(RecordingLimitPayload {
+                kind: RecordingLimitKind::MaxReached,
+                elapsed_ms: MAX_RECORDING_MS + 1,
+                max_ms: MAX_RECORDING_MS,
+            })
+        );
+        assert_eq!(state.next_payload(MAX_RECORDING_MS + 2), None);
+    }
+
+    fn sample_request(source: Source) -> StartRecordingRequest {
+        StartRecordingRequest {
+            source,
+            language: Language::Ja,
+            model: "medium-q5_0".to_string(),
+            mic_device: None,
+            loopback_device: None,
+        }
+    }
+
+    fn test_deps(events: Arc<dyn RecordingEventSink>) -> RecordingStartDeps {
+        RecordingStartDeps {
+            tracker: Arc::new(JobTracker::new()),
+            enqueuer: Arc::new(TestRealtimeJobEnqueuer::default()),
+            events,
+            on_capture_error: Arc::new(|_| {}),
+            on_max_duration: Arc::new(|| {}),
+        }
+    }
+
+    fn sample_devices() -> AudioDevices {
+        AudioDevices {
+            inputs: vec![AudioDevice {
+                id: "mic-1".to_string(),
+                name: "Microphone".to_string(),
+                is_default: true,
+            }],
+            outputs: vec![AudioDevice {
+                id: "speaker-1".to_string(),
+                name: "Speakers".to_string(),
+                is_default: true,
+            }],
+        }
+    }
+
+    fn tone_ms(ms: u64) -> Vec<f32> {
+        vec![0.2; samples_for_ms(ms)]
+    }
+
+    fn silence_ms(ms: u64) -> Vec<f32> {
+        vec![0.0; samples_for_ms(ms)]
+    }
+
+    fn samples_for_ms(ms: u64) -> usize {
+        (crate::audio::wav::WAV_SAMPLE_RATE as u64 * ms / 1_000) as usize
+    }
+
+    fn stop_without_pending(manager: &RecordingManager, db: &Db) -> Session {
+        manager
+            .stop(db, &JobTracker::new(), &TestRealtimeJobEnqueuer::default())
+            .unwrap()
+    }
+
+    fn temp_data_dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("sokki-recording-{name}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[derive(Default)]
+    struct TestRecordingEventSink {
+        levels: StdMutex<Vec<RecordingLevelPayload>>,
+        elapsed: StdMutex<Vec<RecordingElapsedPayload>>,
+        drops: StdMutex<Vec<RecordingDropsPayload>>,
+        limits: StdMutex<Vec<RecordingLimitPayload>>,
+        statuses: StdMutex<Vec<SessionStatusPayload>>,
+    }
+
+    #[derive(Default)]
+    struct TestRealtimeJobEnqueuer {
+        jobs: StdMutex<Vec<TranscribeJob>>,
+    }
+
+    impl RealtimeJobEnqueuer for TestRealtimeJobEnqueuer {
+        fn enqueue_rt_job(&self, job: TranscribeJob) -> Result<(), AppError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+    }
+
+    struct FailingRealtimeJobEnqueuer;
+
+    impl RealtimeJobEnqueuer for FailingRealtimeJobEnqueuer {
+        fn enqueue_rt_job(&self, _job: TranscribeJob) -> Result<(), AppError> {
+            Err(AppError::new(DB_ERROR, "rt worker unavailable"))
+        }
+    }
+
+    impl RecordingEventSink for TestRecordingEventSink {
+        fn emit_level(&self, payload: RecordingLevelPayload) {
+            self.levels.lock().unwrap().push(payload);
+        }
+
+        fn emit_elapsed(&self, payload: RecordingElapsedPayload) {
+            self.elapsed.lock().unwrap().push(payload);
+        }
+
+        fn emit_drops(&self, payload: RecordingDropsPayload) {
+            self.drops.lock().unwrap().push(payload);
+        }
+
+        fn emit_limit(&self, payload: RecordingLimitPayload) {
+            self.limits.lock().unwrap().push(payload);
+        }
+
+        fn emit_session_status(&self, payload: SessionStatusPayload) {
+            self.statuses.lock().unwrap().push(payload);
+        }
+    }
+
+    fn wait_until(timeout: StdDuration, mut condition: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+    }
+}
