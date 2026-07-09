@@ -56,6 +56,13 @@
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
   - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,610,394 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
+- `docs: add readme with build and release instructions`
+  - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。
+  - CPU版NSIS配布候補、Windows実機確認、manual checks、GPU任意検証、既知の制限、依存バージョン変更履歴を追記。
+- `chore: record acceptance checklist status`
+  - `docs/spec.md` §13 ベースの `docs/acceptance.md` を追加。
+  - WSL2で確認済みの build/static/package 項目と、Windows実機待ちの項目を分離して記録。
+  - Windows manual acceptance が未完了のため、`v1.0.0` タグは未作成。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -69,10 +76,10 @@
   - Library import dialog と per-file 失敗一覧が Windows の native dialog / 実ファイルで通るか。
 - 完了後、§13 受入チェックリストを `docs/acceptance.md` に記録(コミット62)。
 
-### 2. M6 残タスク(§15 コミット61〜62)
+### 2. M6 残タスク(§15 コミット62のWindows実機確認)
 
-- コミット61: README に build/release instructions、手動テスト手順、既知の制限、依存バージョン変更履歴を同期。
-- コミット62: `docs/acceptance.md` に §13 の確認結果を記録し、必要ならタグ付け。
+- `docs/acceptance.md` の PENDING_WINDOWS 項目を Windows 10/11 x64 実機で確認し、結果を記録する。
+- すべての受入項目が通った後に `v1.0.0` タグ付けを検討する。
 
 ### 3. コード品質クリーンアップ / 実機リスク
 
