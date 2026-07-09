@@ -65,9 +65,10 @@ pnpm install
 pnpm build
 
 cd src-tauri
-cargo fmt --check
+cargo fmt --all --check
 cargo xwin check --target x86_64-pc-windows-msvc
 cargo xwin clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+cargo xwin test --target x86_64-pc-windows-msvc --all-targets --no-run
 ```
 
 `cargo xwin clippy` が `cargo-xwin` 側の制約で動作しない場合のみ、その理由をこのREADMEに記録し、`cargo xwin check` を必須ゲート、clippy は Windows ネイティブまたは CI での補助ゲートとします。
@@ -86,6 +87,10 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 
 WSL2クロスビルドではNSISのみを対象にします。MSI/WiXビルドはWSL2クロスビルド対象外です。
 
+配布候補は、CPU版NSISインストーラーを必須成果物とします。WSL2で `pnpm tauri:build:win` が通った後、`release/bundle/nsis/` 配下の `Sokki_*_x64-setup.exe` をWindows 10/11 x64上でインストール・起動確認してください。
+
+リリース前の確認結果は [`docs/acceptance.md`](docs/acceptance.md) に記録します。WSL2で代替できない項目は [`docs/manual-windows-checks.md`](docs/manual-windows-checks.md) の手順に従ってWindows実機で確認します。
+
 ## Windows上での実機確認
 
 WSL2でビルドした後、以下はWindows上で確認してください。
@@ -99,6 +104,8 @@ WSL2でビルドした後、以下はWindows上で確認してください。
 - 録音中に使用中のマイクまたは出力デバイスを切断し、録音が自動停止してセッションが `error` 状態になり、保存済みWAVが再生できる
 - 録音WAVとサウンドチェックWAVをWebViewから再生できる
 - assetProtocol scope が正しく機能する
+
+詳細な手動確認手順は [`docs/manual-windows-checks.md`](docs/manual-windows-checks.md) にまとめています。エクスポート、モデル管理、オンボーディング、インポート、リアルタイム文字起こし、復旧系の確認も同ファイルに従ってください。
 
 ## GPUビルド
 
@@ -150,6 +157,13 @@ WindowsではTauriの `app_data_dir()` 配下に保存します。
 - デバイスIDはcpalの制約によりデバイス名ベースです。再接続・同名デバイスでは注意が必要です。
 - マイクとシステム音声の厳密同期はv1では行いません。
 - CPU環境ではリアルタイム文字起こしが遅れる場合があります。その場合もキュー滞留をbusy表示し、録音自体は継続します。
+- バッチ文字起こしは最大15秒チャンクです。録音開始時はリアルタイム文字起こしを優先しますが、環境によっては実行中チャンク1回分の推論完了待ちが発生する可能性があります。
+
+## 依存バージョン変更履歴
+
+依存バージョンの正は [`docs/spec.md`](docs/spec.md) §1.3 です。変更が必要な場合は、`Cargo.toml` / `Cargo.lock` または `package.json` / `pnpm-lock.yaml` と同じコミットで理由をここに追記します。
+
+- 2026-07-09: Tauri v2 / React 18 / whisper-rs 0.16 系を `docs/spec.md` §1.3 に合わせて使用。追加のバージョン逸脱はありません。
 
 ## ライセンス
 
