@@ -62,7 +62,7 @@ pub struct SoundCheckManager {
 }
 
 #[derive(Debug)]
-struct BusyGuard<'a> {
+pub(crate) struct BusyGuard<'a> {
     busy: &'a AtomicBool,
 }
 
@@ -134,6 +134,10 @@ impl SoundCheckManager {
             ));
         }
         Ok(BusyGuard { busy: &self.busy })
+    }
+
+    pub(crate) fn guard_recording_start(&self) -> Result<BusyGuard<'_>, AppError> {
+        self.enter_busy()
     }
 }
 
@@ -399,6 +403,29 @@ mod tests {
         let error = manager.enter_busy().unwrap_err();
 
         assert_eq!(error.code, SOUND_CHECK_BUSY);
+    }
+
+    #[test]
+    fn rejects_recording_start_while_sound_check_is_busy() {
+        let manager = SoundCheckManager::new();
+        let _sound_check = manager.enter_busy().unwrap();
+
+        let error = manager.guard_recording_start().unwrap_err();
+
+        assert_eq!(error.code, SOUND_CHECK_BUSY);
+    }
+
+    #[test]
+    fn recording_start_guard_blocks_sound_check_until_dropped() {
+        let manager = SoundCheckManager::new();
+        let recording_start = manager.guard_recording_start().unwrap();
+
+        let error = manager.enter_busy().unwrap_err();
+        assert_eq!(error.code, SOUND_CHECK_BUSY);
+
+        drop(recording_start);
+
+        assert!(manager.enter_busy().is_ok());
     }
 
     #[test]

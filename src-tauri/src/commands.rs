@@ -175,11 +175,13 @@ pub async fn verify_model(app: tauri::AppHandle, name: String) -> Result<ModelIn
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn start_recording(
     app: tauri::AppHandle,
     db: tauri::State<'_, Db>,
     settings_store: tauri::State<'_, SettingsStore>,
     recording_manager: tauri::State<'_, RecordingManager>,
+    sound_check_manager: tauri::State<'_, SoundCheckManager>,
     tracker: tauri::State<'_, Arc<JobTracker>>,
     worker: tauri::State<'_, Arc<TranscribeWorkerState>>,
     request: StartRecordingRequest,
@@ -198,6 +200,7 @@ pub fn start_recording(
         on_capture_error: capture_error_handler(app.clone()),
         on_max_duration: max_duration_handler(app),
     };
+    let _sound_check_guard = sound_check_manager.guard_recording_start()?;
     recording_manager.start(&db, &data_dir, &settings, request, deps)
 }
 

@@ -86,7 +86,6 @@
 - `/simplify` または `/code-review` を直近の変更(pipeline/recording/sound_check)にかける。
 - 既知の設計メモ:
   - `cpal::Stream` は本来 `!Send` で、`unsafe impl Send`(capture.rs)により別スレッドからの drop を許容している(Windows 限定ターゲット前提)。実機で問題が出た場合はストリーム専有スレッド化を検討。
-  - サウンドチェックの `SoundCheckManager.busy` ガードと `RecordingManager.recording_active` の間に TOCTOU の隙間がある(サウンドチェック中の録音開始は現状ブロックされない)。必要なら start_recording 側で sound check busy を確認する。
   - `npx tsc --noEmit` は node_modules の implicit @types(babel__core 等)で既存エラーが出る(実害なし)。気になる場合は tsconfig の `types` を明示する。
 
 ## ゲート(各コミット前、WSL2)

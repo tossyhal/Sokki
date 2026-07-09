@@ -88,6 +88,15 @@ Prerequisite: at least one usable local Whisper model is available.
 - Remove or corrupt all usable models and confirm clicking `インポート` shows a settings guidance message instead of opening a broken import flow.
 - Confirm the frontend never asks for a save path or constructs an app-data recording path; imported file paths are only passed to the Rust `import_files` command.
 
+## Sound Check And Recording Exclusion
+
+Prerequisite: at least one usable local Whisper model is available.
+
+- Start a sound check and immediately try to start recording before the sound check finishes.
+- Confirm recording does not start while the sound check is running and the app shows a `SOUND_CHECK_BUSY` style error instead of creating a session.
+- After the sound check finishes, start recording and confirm recording can begin normally.
+- While recording is active, try to start a sound check and confirm it is rejected with an already-recording message.
+
 ## Realtime Transcription Pipeline
 
 Prerequisite: a usable local Whisper model is available.
