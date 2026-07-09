@@ -8,6 +8,13 @@ v1では、マイク録音、システム音声録音、マイク+システム�
 
 詳細仕様は [`docs/spec.md`](docs/spec.md)、エージェント向け作業規約は [`AGENTS.md`](AGENTS.md) を参照してください。
 
+## ドキュメント
+
+- [`docs/spec.md`](docs/spec.md): v1 の正規仕様。仕様判断で迷った場合の正です。
+- [`docs/acceptance.md`](docs/acceptance.md): v1 リリース候補の受け入れ状況。
+- [`docs/manual-windows-checks.md`](docs/manual-windows-checks.md): WSL2 では代替できない Windows 実機確認手順。
+- [`docs/design_token.md`](docs/design_token.md): UI トークンの抜粋。実装上の正は `docs/spec.md` §8.4 です。
+
 ## 開発環境
 
 Sokki は Windows 専用アプリですが、開発環境は WSL2 を正規環境にできます。
@@ -90,7 +97,7 @@ WSL2クロスビルドではNSISのみを対象にします。MSI/WiXビルド�
 
 配布候補は、CPU版NSISインストーラーを必須成果物とします。WSL2で `pnpm tauri:build:win` が通った後、`release/bundle/nsis/` 配下の `Sokki_*_x64-setup.exe` をWindows 10/11 x64上でインストール・起動確認してください。
 
-リリース前の確認結果は [`docs/acceptance.md`](docs/acceptance.md) に記録します。WSL2で代替できない項目は [`docs/manual-windows-checks.md`](docs/manual-windows-checks.md) の手順に従ってWindows実機で確認します。
+リリース候補の確認結果は [`docs/acceptance.md`](docs/acceptance.md) に記録します。WSL2で代替できない項目は [`docs/manual-windows-checks.md`](docs/manual-windows-checks.md) の手順に従ってWindows実機で確認します。
 
 ## Windows上での実機確認
 
