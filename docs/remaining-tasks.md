@@ -54,7 +54,7 @@
   - 使用可能モデルがない場合は Settings への誘導を表示し、フロントからファイル内容や app data パスは扱わない。
 - `chore: verify cpu nsis cross build`
   - `pnpm tauri:build:win` により CPU 版 Windows x64 NSIS installer の生成を確認。
-  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,608,564 bytes)。
+  - 成果物: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,615,916 bytes)。
   - WSL2 上のクロスビルド確認であり、起動・インストール・WebView2・音声デバイス・asset protocol 再生は Windows 実機確認が必要。
 - `docs: add readme with build and release instructions`
   - README のチェックコマンドを `cargo fmt --all --check` / `cargo xwin test --all-targets --no-run` まで同期。
@@ -63,6 +63,10 @@
   - `docs/spec.md` §13 ベースの `docs/acceptance.md` を追加。
   - WSL2で確認済みの build/static/package 項目と、Windows実機待ちの項目を分離して記録。
   - Windows manual acceptance が未完了のため、`v1.0.0` タグは未作成。
+- `refactor: keep cpal streams on owner threads`
+  - `cpal::Stream` を `RecordingManager` 状態に直接保持せず、専有スレッド内で生成・保持・drop する `CaptureStreamHandle` に変更。
+  - `unsafe impl Send` を削除し、外側の capture は stop channel と `JoinHandle` のみを保持する。
+  - 実マイク / loopback での start/stop は引き続き Windows 実機確認が必要。
 
 **注意: 録音・サウンドチェックの実機動作は未確認。** WSLからは Windows テストバイナリの実行までしか検証していない(122テストパス、clippy/fmt/pnpm build 通過)。実マイク/ループバックでの録音、DEVICE_LOST 自動停止、サウンドチェック再生は `docs/manual-windows-checks.md` に従い Windows 実機での確認が必要。
 
@@ -85,7 +89,6 @@
 
 - `/simplify` または `/code-review` を直近の変更(pipeline/recording/sound_check)にかける。
 - 既知の設計メモ:
-  - `cpal::Stream` は本来 `!Send` で、`unsafe impl Send`(capture.rs)により別スレッドからの drop を許容している(Windows 限定ターゲット前提)。実機で問題が出た場合はストリーム専有スレッド化を検討。
   - `npx tsc --noEmit` は node_modules の implicit @types(babel__core 等)で既存エラーが出る(実害なし)。気になる場合は tsconfig の `types` を明示する。
 
 ## ゲート(各コミット前、WSL2)

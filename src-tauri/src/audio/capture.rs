@@ -1,5 +1,7 @@
 use std::sync::atomic::AtomicU64;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
@@ -34,17 +36,29 @@ pub trait AudioCapture: Send {
 
 pub struct CpalMicCapture {
     device_name: Option<String>,
-    stream: Option<Stream>,
+    stream: Option<CaptureStreamHandle>,
 }
 
 pub struct CpalLoopbackCapture {
     device_name: Option<String>,
-    stream: Option<Stream>,
+    stream: Option<CaptureStreamHandle>,
 }
 
-// Sokki targets Windows only; cpal marks Stream as non-Send across all platforms.
-unsafe impl Send for CpalMicCapture {}
-unsafe impl Send for CpalLoopbackCapture {}
+struct CaptureStreamHandle {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureStreamHandle {
+    fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 impl CpalMicCapture {
     pub fn new(device_name: Option<String>) -> Self {
@@ -72,43 +86,22 @@ impl AudioCapture for CpalMicCapture {
         drop_count: Arc<AtomicU64>,
         err_cb: CaptureErrorCallback,
     ) -> Result<StreamMeta, AppError> {
-        let host = cpal::default_host();
-        let device = input_device(&host, self.device_name.as_deref())?;
-        let supported_config = device.default_input_config().map_err(|err| {
-            AppError::new(
-                DEVICE_NOT_FOUND,
-                format!("failed to read input device config: {err}"),
-            )
-        })?;
-        let sample_format = supported_config.sample_format();
-        let config = supported_config.config();
-        let meta = StreamMeta {
-            sample_rate: config.sample_rate.0,
-            channels: config.channels,
-        };
-        let stream = build_input_stream_for_format(
-            &device,
-            &config,
-            sample_format,
+        let (handle, meta) = spawn_capture_stream(
+            CaptureDeviceKind::Input,
+            self.device_name.clone(),
             tx,
             pool,
             drop_count,
             err_cb,
-            "input",
         )?;
-
-        stream.play().map_err(|err| {
-            AppError::new(
-                DEVICE_LOST,
-                format!("failed to start input device stream: {err}"),
-            )
-        })?;
-        self.stream = Some(stream);
+        self.stream = Some(handle);
         Ok(meta)
     }
 
     fn stop(&mut self) {
-        self.stream.take();
+        if let Some(stream) = self.stream.take() {
+            stream.stop();
+        }
     }
 }
 
@@ -120,44 +113,142 @@ impl AudioCapture for CpalLoopbackCapture {
         drop_count: Arc<AtomicU64>,
         err_cb: CaptureErrorCallback,
     ) -> Result<StreamMeta, AppError> {
-        let host = cpal::default_host();
-        let device = output_device(&host, self.device_name.as_deref())?;
-        let supported_config = device.default_output_config().map_err(|err| {
-            AppError::new(
-                DEVICE_NOT_FOUND,
-                format!("failed to read output device config: {err}"),
-            )
-        })?;
-        let sample_format = supported_config.sample_format();
-        let config = supported_config.config();
-        let meta = StreamMeta {
-            sample_rate: config.sample_rate.0,
-            channels: config.channels,
-        };
-        let stream = build_input_stream_for_format(
-            &device,
-            &config,
-            sample_format,
+        let (handle, meta) = spawn_capture_stream(
+            CaptureDeviceKind::Loopback,
+            self.device_name.clone(),
             tx,
             pool,
             drop_count,
             err_cb,
-            "loopback",
         )?;
-
-        stream.play().map_err(|err| {
-            AppError::new(
-                DEVICE_LOST,
-                format!("failed to start loopback stream: {err}"),
-            )
-        })?;
-        self.stream = Some(stream);
+        self.stream = Some(handle);
         Ok(meta)
     }
 
     fn stop(&mut self) {
-        self.stream.take();
+        if let Some(stream) = self.stream.take() {
+            stream.stop();
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum CaptureDeviceKind {
+    Input,
+    Loopback,
+}
+
+fn spawn_capture_stream(
+    kind: CaptureDeviceKind,
+    device_name: Option<String>,
+    tx: Sender<AudioPacket>,
+    pool: BufferPool,
+    drop_count: Arc<AtomicU64>,
+    err_cb: CaptureErrorCallback,
+) -> Result<(CaptureStreamHandle, StreamMeta), AppError> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let result =
+            start_stream_on_current_thread(kind, device_name, tx, pool, drop_count, err_cb);
+        match result {
+            Ok((stream, meta)) => {
+                if ready_tx.send(Ok(meta)).is_ok() {
+                    let _stream = stream;
+                    let _ = stop_rx.recv();
+                }
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error));
+            }
+        }
+    });
+
+    match ready_rx.recv() {
+        Ok(Ok(meta)) => Ok((
+            CaptureStreamHandle {
+                stop_tx: Some(stop_tx),
+                thread: Some(thread),
+            },
+            meta,
+        )),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(error) => {
+            let _ = thread.join();
+            Err(AppError::new(
+                DEVICE_LOST,
+                format!("capture stream thread failed before startup: {error}"),
+            ))
+        }
+    }
+}
+
+fn start_stream_on_current_thread(
+    kind: CaptureDeviceKind,
+    device_name: Option<String>,
+    tx: Sender<AudioPacket>,
+    pool: BufferPool,
+    drop_count: Arc<AtomicU64>,
+    err_cb: CaptureErrorCallback,
+) -> Result<(Stream, StreamMeta), AppError> {
+    let host = cpal::default_host();
+    let (device, sample_format, config, label) = match kind {
+        CaptureDeviceKind::Input => {
+            let device = input_device(&host, device_name.as_deref())?;
+            let supported_config = device.default_input_config().map_err(|err| {
+                AppError::new(
+                    DEVICE_NOT_FOUND,
+                    format!("failed to read input device config: {err}"),
+                )
+            })?;
+            (
+                device,
+                supported_config.sample_format(),
+                supported_config.config(),
+                "input",
+            )
+        }
+        CaptureDeviceKind::Loopback => {
+            let device = output_device(&host, device_name.as_deref())?;
+            let supported_config = device.default_output_config().map_err(|err| {
+                AppError::new(
+                    DEVICE_NOT_FOUND,
+                    format!("failed to read output device config: {err}"),
+                )
+            })?;
+            (
+                device,
+                supported_config.sample_format(),
+                supported_config.config(),
+                "loopback",
+            )
+        }
+    };
+    let meta = StreamMeta {
+        sample_rate: config.sample_rate.0,
+        channels: config.channels,
+    };
+    let stream = build_input_stream_for_format(
+        &device,
+        &config,
+        sample_format,
+        tx,
+        pool,
+        drop_count,
+        err_cb,
+        label,
+    )?;
+
+    stream.play().map_err(|err| {
+        AppError::new(
+            DEVICE_LOST,
+            format!("failed to start {label} device stream: {err}"),
+        )
+    })?;
+    Ok((stream, meta))
 }
 
 #[allow(clippy::too_many_arguments)]

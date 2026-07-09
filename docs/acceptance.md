@@ -2,7 +2,7 @@
 
 Date: 2026-07-09
 Spec source: `docs/spec.md` §13
-Artifact under review: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,608,564 bytes)
+Artifact under review: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sokki_0.0.0_x64-setup.exe` (25,615,916 bytes)
 
 This file records the current verification state. Items that need a Windows desktop, WebView2, native dialogs, microphone, WASAPI loopback, playback, or installer execution are intentionally left pending until they are checked on Windows 10/11 x64. Use `docs/manual-windows-checks.md` for the manual procedures.
 
